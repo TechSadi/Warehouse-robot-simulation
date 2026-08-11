@@ -1,0 +1,108 @@
+.sim-canvas {
+  flex: 1;
+  min-width: 0;
+  padding: var(--gap);
+  display: flex;
+}
+
+.sim-canvas__frame {
+  position: relative;
+  flex: 1;
+  border: 1px solid var(--line-bright);
+  border-radius: var(--panel-radius);
+  background-color: var(--bg-void);
+  overflow: hidden;
+}
+
+.sim-canvas__frame > .grid-canvas {
+  position: absolute;
+  inset: 0;
+}
+
+/* Corner tick marks, like an engineering drawing's crop marks. This is the
+   one signature flourish of the page; everything else stays quiet. */
+.sim-canvas__tick {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-color: var(--cyan);
+  opacity: 0.55;
+  pointer-events: none;
+  z-index: 2;
+}
+.sim-canvas__tick--top-left {
+  top: 14px;
+  left: 14px;
+  border-top: 2px solid;
+  border-left: 2px solid;
+}
+.sim-canvas__tick--top-right {
+  top: 14px;
+  right: 14px;
+  border-top: 2px solid;
+  border-right: 2px solid;
+}
+.sim-canvas__tick--bottom-left {
+  bottom: 14px;
+  left: 14px;
+  border-bottom: 2px solid;
+  border-left: 2px solid;
+}
+.sim-canvas__tick--bottom-right {
+  bottom: 14px;
+  right: 14px;
+  border-bottom: 2px solid;
+  border-right: 2px solid;
+}
+
+.sim-canvas__axis-label {
+  position: absolute;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  pointer-events: none;
+  z-index: 2;
+}
+.sim-canvas__axis-label--x {
+  bottom: 16px;
+  right: 40px;
+}
+.sim-canvas__axis-label--y {
+  top: 40px;
+  left: 16px;
+}
+
+.sim-canvas__readout {
+  position: absolute;
+  bottom: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line-bright);
+  background: rgba(18, 22, 27, 0.85);
+  backdrop-filter: blur(4px);
+  font-size: 12px;
+  color: var(--text-secondary);
+  pointer-events: none;
+  z-index: 2;
+  white-space: nowrap;
+}
+
+.sim-canvas__readout-coord {
+  color: var(--cyan);
+}
+
+.sim-canvas__readout-type {
+  color: var(--text-primary);
+  border-left: 1px solid var(--line-bright);
+  padding-left: 10px;
+}
+
+.sim-canvas__readout-hint {
+  color: var(--text-muted);
+}

@@ -1,0 +1,128 @@
+/* ---------------------------------------------------------------------------
+   Design tokens
+   Direction: a night-shift warehouse ops room, not a generic SaaS dashboard.
+   Deep graphite base, amber for hazard-signage-style alerts/active state,
+   cyan for live/operational data (paths, telemetry). Mono face carries a lot
+   of the personality since most on-screen content is coordinates and stats.
+--------------------------------------------------------------------------- */
+:root {
+  /* Surfaces */
+  --bg-void: #0b0e11;
+  --bg-panel: #12161b;
+  --bg-panel-raised: #171c22;
+  --line: #232a32;
+  --line-bright: #333c47;
+
+  /* Accents */
+  --amber: #f5a623;
+  --amber-soft: rgba(245, 166, 35, 0.14);
+  --cyan: #3ddad7;
+  --cyan-soft: rgba(61, 218, 215, 0.12);
+  --danger: #e5484d;
+  --danger-soft: rgba(229, 72, 77, 0.14);
+  --success: #4ade80;
+  --success-soft: rgba(74, 222, 128, 0.14);
+
+  /* Text */
+  --text-primary: #e8ecef;
+  --text-secondary: #a8b1bc;
+  --text-muted: #656f7b;
+
+  /* Type */
+  --font-display: 'Space Grotesk', 'Segoe UI', sans-serif;
+  --font-body: 'Inter', 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', Consolas, monospace;
+
+  /* Layout */
+  --nav-height: 56px;
+  --sidebar-width: 260px;
+  --panel-radius: 6px;
+  --gap: 16px;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+p {
+  margin: 0;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* Utility: small uppercase tracked label used for section eyebrows and
+   telemetry field names throughout the dashboard. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Utility: tabular data readout (coordinates, battery %, counts). */
+.readout {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Scrollbars that fit the control-room look instead of the OS default. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-bright) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line-bright);
+  border-radius: 4px;
+}
+
+/* Visible keyboard focus everywhere, including custom controls. */
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
