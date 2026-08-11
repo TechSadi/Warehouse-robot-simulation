@@ -18,8 +18,8 @@ async function start() {
   // warehouse) need to be cleared explicitly on shutdown, or they'd keep
   // firing (and keep the process alive) after httpServer.close() below.
 
-  httpServer.listen(env.port, () => {
-    console.log(`[server] Listening on http://localhost:${env.port} (${env.nodeEnv})`);
+  httpServer.listen(env.port, '0.0.0.0', () => {
+    console.log(`[server] Listening on port ${env.port} (${env.nodeEnv})`);
   });
 
   const shutdown = (signal) => {
