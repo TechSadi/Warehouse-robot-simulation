@@ -34,7 +34,10 @@ const robotSchema = new mongoose.Schema(
     // isn't persisted here - see backend/src/engine/robots/robotEngine.js.
     taskQueue: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Order' }],
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true}
+  }
 );
 
 robotSchema.index({ warehouseId: 1, status: 1 });
