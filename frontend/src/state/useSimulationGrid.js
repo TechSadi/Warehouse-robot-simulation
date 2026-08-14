@@ -123,7 +123,7 @@ export function useSimulationGrid() {
   const applyGrid = useCallback((newGrid, meta = {}) => {
     setGrid(newGrid);
     setSelectedCell(null);
-    setSyncedWarehouseId(meta.warehouseId ?? null);
+    setSyncedWarehouseId((prev) => ('warehouseId' in meta ? meta.warehouseId : prev));
     if (meta.name !== undefined) setLayoutName(meta.name);
     if (meta.schedulingStrategy) setSchedulingStrategyState(meta.schedulingStrategy);
     setSyncStatus('idle');
