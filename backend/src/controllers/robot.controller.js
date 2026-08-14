@@ -27,12 +27,8 @@ const getOne = asyncHandler(async (req, res) => {
 
 const create = asyncHandler(async (req, res) => {
   const robot = await Robot.create(req.body);
-  // NOTE: this doesn't add the robot to an already-cached live engine (see
-  // simulationManager.getEngine's lazy Mongo load) - a known pre-existing
-  // gap, not something Milestone 11 changes. The real-time event still
-  // fires so a freshly spawned robot shows up in every connected client's
-  // roster immediately; it just won't move until the engine cache is next
-  // rebuilt (warehouse update, or server restart).
+  // create a new robot while simulation is still going on
+  simulationManager.addRobotToCachedEngine(robot.warehouseId, robot);
   simulationEvents.emit('robots:changed', { warehouseId: String(robot.warehouseId), robots: [robot] });
   res.status(201).json({ success: true, data: robot });
 });

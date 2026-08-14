@@ -60,6 +60,31 @@ class SimulationManager {
     this.schedulerStates.delete(key);
   }
 
+  /**
+  * If a warehouse's engine is already cached, adds a newly-created robot
+  * to it immediately - so a robot spawned via POST /robots while a
+  * simulation is already running can be assigned tasks and moved right
+  * away, with no restart or layout edit needed. Synchronous and
+  * side-effect-free when nothing is cached yet.
+  */
+  addRobotToCachedEngine(warehouseId, robotDoc) {
+    const key = String(warehouseId);
+    const engine = this.engines.get(key);
+    if (!engine) return false;
+    try {
+      engine.spawnRobot({
+        id: robotDoc._id.toString(),
+        name: robotDoc.name,
+        position: { x: robotDoc.position.x, y: robotDoc.position.y },
+        speed: robotDoc.speed,
+        battery: robotDoc.battery,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Returns the persistent scheduling state for a warehouse (round-robin
    * cursor, per-robot completed-order counts), creating it on first use.
    * Doesn't require the warehouse/engine to exist yet - it's plain
