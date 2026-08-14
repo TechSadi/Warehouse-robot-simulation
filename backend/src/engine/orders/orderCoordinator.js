@@ -39,6 +39,16 @@ class OrderCoordinator {
     if (snapshot.status === 'error') {
       return { success: false, snapshot };
     }
+
+    if (snapshot.status === 'idle') {
+      // Already standing on the pickup cell - start the delivery leg
+      // immediately, since nothing would ever trigger it otherwise.
+      const { deliverySnapshot, unreachable } = this._tryStartDelivery(robotId, deliveryLocation);
+      if (unreachable) return { success: false, snapshot: deliverySnapshot || snapshot };
+      this.assignments.set(robotId, { orderId, pickupLocation, deliveryLocation, phase: PHASES.TO_DELIVERY });
+      return { success: true, snapshot: deliverySnapshot, pickedUpImmediately: true };
+    }
+    
     this.assignments.set(robotId, { orderId, pickupLocation, deliveryLocation, phase: PHASES.TO_PICKUP });
     return { success: true, snapshot };
   }
