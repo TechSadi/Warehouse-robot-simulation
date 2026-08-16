@@ -48,6 +48,22 @@ async function dispatchPendingOrders(warehouseId) {
   const pendingOrders = await Order.find({ warehouseId, status: 'pending' });
   const schedulerState = simulationManager.getSchedulerState(warehouseId);
 
+
+  // Bugfix: a robot idling at or below the auto-charge threshold (see
+  // RobotEngine._maybeAutoCharge) needs a tick where it stays idle and
+  // unassigned so the engine's own low-battery check gets a chance to
+  // route it to a charging station on its *next* tick() call. Without
+  // this filter, a warehouse with any backlog of pending orders would
+  // always re-dispatch a freshly-idle low-battery robot onto a new order
+  // in this same tick - faster than the engine could ever notice its
+  // battery was low - so auto-charging effectively never fired. Robots
+  // ran themselves flat, froze permanently in the `error` state once
+  // battery hit 0 (a dead robot can't move to a charger under its own
+  // power), and piled up as immovable obstacles that clogged the grid for
+  // everyone else.
+  
+  const availableRobots = engine.getAllRobots().filter((r) => r.battery > LOW_BATTERY_THRESHOLD);
+
   const plan = planAssignments({
     strategyName: warehouse.schedulingStrategy,
     orders: pendingOrders.map((o) => ({
@@ -56,7 +72,7 @@ async function dispatchPendingOrders(warehouseId) {
       createdAt: o.createdAt,
       pickupLocation: o.pickupLocation,
     })),
-    robots: engine.getAllRobots(),
+    robots: availableRobots, // was: engine.getAllRobots()
     coordinator,
     context: schedulerState,
   });
