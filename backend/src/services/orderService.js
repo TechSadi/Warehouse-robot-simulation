@@ -4,6 +4,7 @@ const Log = require('../models/Log');
 const { generateRandomOrders } = require('../engine/orders/orderGenerator');
 const { planAssignments } = require('../engine/scheduling/strategies');
 const { warehouseToGrid } = require('../engine/grid/warehouseGrid');
+const { LOW_BATTERY_THRESHOLD } = require('../engine/robots/robotEngine')
 const simulationManager = require('./simulationManager');
 const { ApiError } = require('../middleware/errorHandler');
 const simulationEvents = require('../events/simulationEvents');
@@ -61,7 +62,7 @@ async function dispatchPendingOrders(warehouseId) {
   // battery hit 0 (a dead robot can't move to a charger under its own
   // power), and piled up as immovable obstacles that clogged the grid for
   // everyone else.
-  
+
   const availableRobots = engine.getAllRobots().filter((r) => r.battery > LOW_BATTERY_THRESHOLD);
 
   const plan = planAssignments({
