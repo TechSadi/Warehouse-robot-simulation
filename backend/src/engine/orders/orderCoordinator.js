@@ -53,6 +53,25 @@ class OrderCoordinator {
     return { success: true, snapshot };
   }
 
+
+  _tryStartDelivery(robotId, deliveryLocation) {
+    let deliverySnapshot;
+
+    try {
+      deliverySnapshot = this.engine.assignTask(robotId, deliveryLocation);
+    } catch {
+      return {
+        deliverySnapshot: null,
+        unreachable: true,
+      };
+    }
+
+    return {
+      deliverySnapshot,
+      unreachable: deliverySnapshot.status === 'error',
+    };
+  }
+
   /**
    * Call after engine.tick() with the snapshots it returned. Detects
    * robots that just went idle while on an order - meaning they arrived
