@@ -12,6 +12,12 @@ state; the full build history - what each milestone added, the trade-offs
 made along the way, and the bugs caught and fixed as the project grew -
 is preserved in [`docs/DEVELOPMENT_LOG.md`](./docs/DEVELOPMENT_LOG.md).
 
+## Live Demo
+
+🔗 [Click here to view the live demo](https://warehouse-robot-simulation-b6uc.vercel.app/)
+
+[Demo]
+
 ## What it does
 
 - **Design a warehouse floor plan** on an editable grid - shelves,
