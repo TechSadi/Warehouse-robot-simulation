@@ -10,7 +10,9 @@
     "lint": "node scripts/lint.js",
     "test": "jest --runInBand",
     "benchmark": "node scripts/benchmark.js",
-    "test:security": "jest tests/security --runInBand"
+    "test:security": "jest tests/security --runInBand",
+    "test:reliability": "jest tests/reliability --runInBand",
+    "check:reliability": "node scripts/reliability-check.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

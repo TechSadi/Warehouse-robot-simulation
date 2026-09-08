@@ -5,6 +5,8 @@ const { ApiError } = require('../middleware/errorHandler');
 const { pick } = require('../middleware/dto');
 const { SIMULATION_OWNED_FIELDS } = require('../domain/robotLifecycle');
 const simulationManager = require('../services/simulationManager');
+const warehouseLock = require('../services/warehouseLock');
+const orderService = require('../services/orderService');
 const simulationEvents = require('../events/simulationEvents');
 
 /**
@@ -91,11 +93,33 @@ const create = asyncHandler(async (req, res) => {
   ) {
     throw new ApiError(422, 'position must be inside the warehouse bounds');
   }
+  // A robot is *placed in a cell*. A fractional starting position is not
+  // one, and the engine cannot spawn on it - so accepting it here created
+  // a robot that existed in MongoDB and could never join the simulation,
+  // which is precisely the desynchronisation this phase is about. A
+  // fractional position only ever arises legitimately mid-move, and the
+  // simulation owns that.
+  if (!Number.isInteger(position.x) || !Number.isInteger(position.y)) {
+    throw new ApiError(422, 'position must name a whole cell (integer x and y)');
+  }
 
   const robot = await Robot.create(payload);
-  // create a new robot while simulation is still going on
-  simulationManager.addRobotToCachedEngine(robot.warehouseId, robot);
-  simulationEvents.emit('robots:changed', { warehouseId: String(robot.warehouseId), robots: [robot] });
+
+  // Registering the robot with the live engine happens inside the
+  // warehouse lock, so a robot created while a simulation is running joins
+  // the fleet cleanly between two ticks rather than part-way through one -
+  // a tick that had already iterated past its insertion point would move
+  // every other robot without ever seeing it, including for collision
+  // checks. If nothing is loaded for this warehouse yet, there is nothing
+  // to join: the next engine load reads it straight from Mongo.
+  const snapshot = await warehouseLock.runExclusive(warehouse._id, () =>
+    simulationManager.addRobotToCachedEngine(robot.warehouseId, robot)
+  );
+
+  simulationEvents.emit('robots:changed', {
+    warehouseId: String(robot.warehouseId),
+    robots: [snapshot || robot],
+  });
   res.status(201).json({ success: true, data: robot });
 });
 
@@ -112,9 +136,30 @@ const update = asyncHandler(async (req, res) => {
   res.json({ success: true, data: robot });
 });
 
+/**
+ * Deleting a robot has to unwind three things, not one.
+ *
+ * Previously it deleted the MongoDB document and stopped there. The live
+ * engine still held the robot: it kept consuming its path, kept occupying
+ * (and so blocking) cells for every other robot's collision check, kept
+ * being broadcast to clients as part of the fleet, and - if it was
+ * mid-order - kept an OrderCoordinator assignment alive that pinned that
+ * order in an in-flight state permanently, since only an arrival event
+ * from that robot could ever have advanced it. The document was gone and
+ * the simulation had not noticed.
+ */
 const remove = asyncHandler(async (req, res) => {
   const robot = await Robot.findByIdAndDelete(req.resource._id);
   if (!robot) throw new ApiError(404, 'Robot not found');
+
+  const releasedOrderIds = await warehouseLock.runExclusive(robot.warehouseId, () =>
+    simulationManager.removeRobotFromCachedEngine(robot.warehouseId, robot._id)
+  );
+  // Outside the lock: this is Mongo bookkeeping about orders, and it
+  // covers both what the coordinator was holding and any order document
+  // still naming this robot (e.g. one assigned before a restart).
+  await orderService.releaseOrdersForRobot(robot.warehouseId, robot._id, releasedOrderIds);
+
   simulationEvents.emit('robots:removed', {
     warehouseId: String(robot.warehouseId),
     robotId: String(robot._id),
@@ -154,39 +199,54 @@ const assignTask = asyncHandler(async (req, res) => {
     throw new ApiError(422, 'destination is outside the warehouse bounds');
   }
 
-  const engine = await loadEngineFor(doc);
-  const snapshot = engine.assignTask(String(doc._id), destination);
-  await simulationManager.persistRobot(doc._id, snapshot);
+  // Serialized with ticks and dispatch: `assignTask` runs A* against the
+  // current grid and fleet, and persists the result - both of which a
+  // concurrent tick would be changing underneath it.
+  const snapshot = await warehouseLock.runExclusive(doc.warehouseId, async () => {
+    const engine = await loadEngineFor(doc);
+    const next = engine.assignTask(String(doc._id), destination);
+    await simulationManager.persistRobot(doc._id, next);
+    return next;
+  });
   broadcastRobot(doc, snapshot);
   res.json({ success: true, data: snapshot });
 });
 
 const startCharging = asyncHandler(async (req, res) => {
   const doc = req.resource;
-  const engine = await loadEngineFor(doc);
-  // The engine owns the transition rules (idle/error -> charging, only on
-  // a charging cell) and throws INVALID_TRANSITION otherwise.
-  const snapshot = engine.startCharging(String(doc._id));
-  await simulationManager.persistRobot(doc._id, snapshot);
+  const snapshot = await warehouseLock.runExclusive(doc.warehouseId, async () => {
+    const engine = await loadEngineFor(doc);
+    // The engine owns the transition rules (idle/error -> charging, only
+    // on a charging cell) and throws INVALID_TRANSITION otherwise.
+    const next = engine.startCharging(String(doc._id));
+    await simulationManager.persistRobot(doc._id, next);
+    return next;
+  });
   broadcastRobot(doc, snapshot);
   res.json({ success: true, data: snapshot });
 });
 
 const clearError = asyncHandler(async (req, res) => {
   const doc = req.resource;
-  const engine = await loadEngineFor(doc);
-  const snapshot = engine.clearError(String(doc._id));
-  await simulationManager.persistRobot(doc._id, snapshot);
+  const snapshot = await warehouseLock.runExclusive(doc.warehouseId, async () => {
+    const engine = await loadEngineFor(doc);
+    const next = engine.clearError(String(doc._id));
+    await simulationManager.persistRobot(doc._id, next);
+    return next;
+  });
   broadcastRobot(doc, snapshot);
   res.json({ success: true, data: snapshot });
 });
 
 const markBroken = asyncHandler(async (req, res) => {
   const doc = req.resource;
-  const engine = await loadEngineFor(doc);
   const reason = typeof req.body.reason === 'string' ? req.body.reason : undefined;
-  const snapshot = engine.markBroken(String(doc._id), reason);
-  await simulationManager.persistRobot(doc._id, snapshot);
+  const snapshot = await warehouseLock.runExclusive(doc.warehouseId, async () => {
+    const engine = await loadEngineFor(doc);
+    const next = engine.markBroken(String(doc._id), reason);
+    await simulationManager.persistRobot(doc._id, next);
+    return next;
+  });
   broadcastRobot(doc, snapshot);
   simulationEvents.emit('notification', {
     warehouseId: String(doc.warehouseId),

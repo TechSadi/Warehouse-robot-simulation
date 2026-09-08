@@ -29,14 +29,28 @@ jest.mock('../src/models/Warehouse', () => ({
   CELL_TYPES: ['shelf', 'charging', 'obstacle', 'dock'],
 }));
 
+// Deleting a robot now also releases any order it was working - see
+// controllers/robot.controller.js - so this suite has to model the orders
+// collection too.
+jest.mock('../src/models/Order', () => ({
+  find: jest.fn(),
+  updateMany: jest.fn(),
+  // The order routes build their validators from these at import time.
+  STATUSES: ['pending', 'assigned', 'picking_up', 'picked_up', 'delivering', 'delivered', 'cancelled'],
+  PRIORITIES: ['low', 'normal', 'high', 'urgent'],
+}));
+
 const Robot = require('../src/models/Robot');
 const Warehouse = require('../src/models/Warehouse');
+const Order = require('../src/models/Order');
 const app = require('../src/app');
 
 const warehouse = makeWarehouse(WAREHOUSE_ID, USER_A_ID, { rows: 20, cols: 20 });
 
 beforeEach(() => {
   jest.clearAllMocks();
+  Order.find.mockReturnValue(mockQuery([]));
+  Order.updateMany.mockResolvedValue({ modifiedCount: 0 });
   mockOwnership(Warehouse, { warehouse });
   // Every :id route resolves the robot first, then its warehouse's owner.
   Robot.findById.mockResolvedValue({ _id: VALID_ID, name: 'R1', warehouseId: WAREHOUSE_ID });
@@ -140,6 +154,24 @@ describe('DELETE /api/robots/:id', () => {
     Robot.findByIdAndDelete.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
     const res = await authed(request(app).delete(`/api/robots/${VALID_ID}`));
     expect(res.status).toBe(204);
+  });
+
+  it('releases the orders a deleted robot was carrying', async () => {
+    // Without this the order document keeps naming a robot that no longer
+    // exists, in a state only that robot could ever have advanced.
+    Robot.findByIdAndDelete.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
+    Order.find.mockReturnValue(mockQuery([{ _id: 'o1' }]));
+
+    const res = await authed(request(app).delete(`/api/robots/${VALID_ID}`));
+
+    expect(res.status).toBe(204);
+    expect(Order.find).toHaveBeenCalledWith(
+      expect.objectContaining({ assignedRobot: VALID_ID, warehouseId: WAREHOUSE_ID })
+    );
+    expect(Order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ _id: { $in: ['o1'] } }),
+      { $set: { status: 'pending', assignedRobot: null, assignedAt: null, pickedUpAt: null } }
+    );
   });
 
   it('returns 404 deleting a robot that does not exist', async () => {

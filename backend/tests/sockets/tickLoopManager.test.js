@@ -1,8 +1,11 @@
+// The loop calls `runAutoTick`, not `runAutoTick`: an automatic tick that
+// arrives while the previous one is still running is dropped rather than
+// queued behind it (see services/warehouseLock.js).
 jest.mock('../../src/services/tickRunner', () => ({
-  runTick: jest.fn().mockResolvedValue(null),
+  runAutoTick: jest.fn().mockResolvedValue({ skipped: false, value: null }),
 }));
 
-const { runTick } = require('../../src/services/tickRunner');
+const { runAutoTick } = require('../../src/services/tickRunner');
 const { TickLoopManager, room } = require('../../src/sockets/tickLoopManager');
 
 const WAREHOUSE_ID = '507f1f77bcf86cd799439022';
@@ -27,6 +30,7 @@ function fakeIo(occupantsByRoom = {}) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  runAutoTick.mockResolvedValue({ skipped: false, value: null });
   jest.useFakeTimers();
 });
 
@@ -35,19 +39,19 @@ afterEach(() => {
 });
 
 describe('TickLoopManager.start', () => {
-  it('calls runTick repeatedly at the configured interval', () => {
+  it('calls runAutoTick repeatedly at the configured interval', () => {
     const manager = new TickLoopManager(100);
     const io = fakeIo();
 
     manager.start(io, WAREHOUSE_ID, 0.1);
-    expect(runTick).not.toHaveBeenCalled(); // nothing until the first interval elapses
+    expect(runAutoTick).not.toHaveBeenCalled(); // nothing until the first interval elapses
 
     jest.advanceTimersByTime(100);
-    expect(runTick).toHaveBeenCalledTimes(1);
-    expect(runTick).toHaveBeenCalledWith(WAREHOUSE_ID, 0.1);
+    expect(runAutoTick).toHaveBeenCalledTimes(1);
+    expect(runAutoTick).toHaveBeenCalledWith(WAREHOUSE_ID, 0.1);
 
     jest.advanceTimersByTime(300);
-    expect(runTick).toHaveBeenCalledTimes(4);
+    expect(runAutoTick).toHaveBeenCalledTimes(4);
   });
 
   it('defaults deltaSeconds from the interval when none is given', () => {
@@ -57,7 +61,7 @@ describe('TickLoopManager.start', () => {
     manager.start(io, WAREHOUSE_ID);
     jest.advanceTimersByTime(200);
 
-    expect(runTick).toHaveBeenCalledWith(WAREHOUSE_ID, 0.2);
+    expect(runAutoTick).toHaveBeenCalledWith(WAREHOUSE_ID, 0.2);
   });
 
   it('broadcasts simulation:status running:true to the warehouse room', () => {
@@ -69,7 +73,7 @@ describe('TickLoopManager.start', () => {
     expect(io.emitted).toContainEqual({
       room: room(WAREHOUSE_ID),
       event: 'simulation:status',
-      payload: { warehouseId: WAREHOUSE_ID, running: true },
+      payload: expect.objectContaining({ warehouseId: WAREHOUSE_ID, running: true, deltaSeconds: 0.1 }),
     });
   });
 
@@ -82,7 +86,7 @@ describe('TickLoopManager.start', () => {
     manager.stop(io, WAREHOUSE_ID); // a single stop should be enough to fully stop it
 
     jest.advanceTimersByTime(500);
-    expect(runTick).not.toHaveBeenCalled();
+    expect(runAutoTick).not.toHaveBeenCalled();
   });
 
   it('tracks isRunning correctly', () => {
@@ -104,11 +108,11 @@ describe('TickLoopManager.stop', () => {
 
     manager.start(io, WAREHOUSE_ID, 0.1);
     jest.advanceTimersByTime(100);
-    expect(runTick).toHaveBeenCalledTimes(1);
+    expect(runAutoTick).toHaveBeenCalledTimes(1);
 
     manager.stop(io, WAREHOUSE_ID);
     jest.advanceTimersByTime(500);
-    expect(runTick).toHaveBeenCalledTimes(1); // unchanged - no more ticks after stop
+    expect(runAutoTick).toHaveBeenCalledTimes(1); // unchanged - no more ticks after stop
   });
 
   it('broadcasts simulation:status running:false', () => {
@@ -143,7 +147,7 @@ describe('TickLoopManager.stopIfIdle', () => {
     manager.stopIfIdle(io, WAREHOUSE_ID);
 
     jest.advanceTimersByTime(500);
-    expect(runTick).not.toHaveBeenCalled();
+    expect(runAutoTick).not.toHaveBeenCalled();
     expect(manager.isRunning(WAREHOUSE_ID)).toBe(false);
   });
 
@@ -155,7 +159,7 @@ describe('TickLoopManager.stopIfIdle', () => {
     manager.stopIfIdle(io, WAREHOUSE_ID);
 
     jest.advanceTimersByTime(100);
-    expect(runTick).toHaveBeenCalledTimes(1);
+    expect(runAutoTick).toHaveBeenCalledTimes(1);
   });
 
   it('is a no-op when nothing is running for that warehouse', () => {
@@ -177,7 +181,7 @@ describe('TickLoopManager.stopAll', () => {
     manager.stopAll();
 
     jest.advanceTimersByTime(500);
-    expect(runTick).not.toHaveBeenCalled();
+    expect(runAutoTick).not.toHaveBeenCalled();
     expect(manager.isRunning('w1')).toBe(false);
     expect(manager.isRunning('w2')).toBe(false);
   });

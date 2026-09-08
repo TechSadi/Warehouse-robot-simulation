@@ -14,6 +14,7 @@ jest.mock('../../src/models/Order', () => ({
   find: jest.fn(),
   insertMany: jest.fn(),
   findByIdAndUpdate: jest.fn(),
+  updateMany: jest.fn(),
   bulkWrite: jest.fn(),
 }));
 
@@ -55,6 +56,9 @@ beforeEach(() => {
   jest.clearAllMocks();
   simulationManager.invalidate(WAREHOUSE_ID);
   Order.findByIdAndUpdate.mockResolvedValue({});
+  // Engine construction reconciles in-flight orders back to `pending` -
+  // see simulationManager.reconcileWarehouse.
+  Order.updateMany.mockResolvedValue({ modifiedCount: 0 });
   Order.bulkWrite.mockResolvedValue({});
   Robot.findByIdAndUpdate.mockResolvedValue({});
   Robot.bulkWrite.mockResolvedValue({});
@@ -208,10 +212,28 @@ describe('processTickEvents', () => {
     expect(Log.create).toHaveBeenCalledWith(expect.objectContaining({ level: 'warn' }));
   });
 
-  it('does not call bulkWrite when there are no order-affecting events', async () => {
+  it('releases an unreachable delivery back to pending rather than stranding it', async () => {
+    // Reliability phase: the coordinator has already dropped its
+    // assignment by the time this event arrives, so if the document is not
+    // returned to `pending` the order sits in an in-flight state with no
+    // robot working it and no way back into the dispatch pool.
     await orderService.processTickEvents(WAREHOUSE_ID, [
       { type: 'delivery_unreachable', robotId: 'r1', orderId: 'o1' },
     ]);
+
+    const [ops] = Order.bulkWrite.mock.calls[0];
+    expect(ops).toEqual([
+      {
+        updateOne: {
+          filter: { _id: 'o1', status: { $in: ['assigned', 'picking_up', 'picked_up', 'delivering'] } },
+          update: { status: 'pending', assignedRobot: null, assignedAt: null, pickedUpAt: null },
+        },
+      },
+    ]);
+  });
+
+  it('does not call bulkWrite when there are no order-affecting events', async () => {
+    await orderService.processTickEvents(WAREHOUSE_ID, []);
     expect(Order.bulkWrite).not.toHaveBeenCalled();
   });
 });

@@ -48,6 +48,14 @@ one user. Requesting another user's resource returns `404`, identical to
 one that never existed - deliberately, so ids cannot be enumerated. List
 endpoints are scoped to the caller.
 
+**Busy warehouses.** Operations that mutate one warehouse's live
+simulation - ticking, dispatching, changing obstacles, creating or
+deleting robots - run one at a time per warehouse. Requests wait their
+turn rather than interleaving. If a warehouse is so backed up that more
+than 32 are already queued, further ones are rejected with `503` instead
+of being added to the queue. See
+[`SIMULATION_ARCHITECTURE.md`](./SIMULATION_ARCHITECTURE.md#3-concurrency-model).
+
 Full details in [`SECURITY.md`](./SECURITY.md).
 
 ---
@@ -121,7 +129,7 @@ how this relates to robots, orders, statistics, and logs.
 | GET | `/warehouses/:id` | Get one |
 | POST | `/warehouses` | Create |
 | PUT | `/warehouses/:id` | Update (partial) |
-| DELETE | `/warehouses/:id` | Delete |
+| DELETE | `/warehouses/:id` | Delete, **cascading** to the warehouse's robots, orders, statistics and logs |
 | PATCH | `/warehouses/:id/activate` | Mark active, deactivate every other warehouse |
 | POST | `/warehouses/:id/path` | Run A* between two cells |
 | POST | `/warehouses/:id/tick` | Manually advance the live simulation once |
@@ -192,6 +200,10 @@ server-owned Socket.IO tick loop calls automatically every 500ms while a
 simulation is running (see [`ARCHITECTURE.md`](./ARCHITECTURE.md#the-tick-loop))
 - this endpoint is for scripting a single step without a socket
 connection, not how the live dashboard advances the simulation.
+
+A manual tick arriving while the automatic loop is mid-tick waits and is
+then applied as a whole, separate step - it is never interleaved with one.
+Returns `503` if the warehouse's operation queue is already full.
 
 ### `POST /warehouses/:id/obstacles`
 
@@ -360,8 +372,9 @@ validated and rate-limited per socket. See
 |---|---|---|
 | `warehouse:join` | `warehouseId` (string) | Start receiving that warehouse's events |
 | `warehouse:leave` | `warehouseId` | Stop receiving them |
-| `simulation:start` | `{ warehouseId, deltaSeconds? }` | Start (or join) that warehouse's server-owned tick loop |
-| `simulation:stop` | `{ warehouseId }` | Stop it |
+| `simulation:start` | `{ warehouseId, deltaSeconds? }` | Start (or join) that warehouse's server-owned tick loop. Idempotent: starting an already-running warehouse changes nothing, and the reply says so. |
+| `simulation:stop` | `{ warehouseId }` | Stop it. Idempotent in the same way. |
+| `simulation:sync` | `{ warehouseId }` | Ask for the server's current view of this warehouse. Sent automatically on every join; request it explicitly after a reconnect if you are not rejoining. |
 
 ### Server → client (errors)
 
@@ -386,7 +399,29 @@ does not listen for them sees a silent no-op.
 | `orders:changed` | `{ warehouseId, reason, ... }` | An invalidation signal, not a diff - re-fetch orders for this warehouse when you see it |
 | `obstacles:changed` | `{ warehouseId, obstacles: [...] }` | Always the full current obstacle list |
 | `notification` | `{ warehouseId, level, message, timestamp }` | A notification-worthy event (robot error, delivery, unreachable destination) |
-| `simulation:status` | `{ warehouseId, running }` | The tick loop started or stopped - including for clients who didn't request the change themselves |
+| `simulation:status` | `{ warehouseId, running, deltaSeconds?, startedAt?, ticks?, skippedTicks?, failedTicks?, changed? }` | The tick loop started or stopped - broadcast to the room, and also sent directly to whoever asked, even when their request changed nothing (`changed: false`) |
+| `simulation:sync` | `{ warehouseId, running, robots: [...], obstacles: [...], serverTime }` | The authoritative current state. Sent on every join and on request. **Replace** your robot and obstacle state with it rather than merging - see below. |
+| `warehouse:deleted` | `{ warehouseId }` | The warehouse was deleted. Its tick loop is stopped and the room is emptied. |
+
+### Reconnecting
+
+A Socket.IO client that reconnects has **not** stayed synchronised. Room
+membership is dropped server-side on disconnect, and the events broadcast
+during the gap are gone - they are fire-and-forget broadcasts, not a
+replayable stream. So on `connect`:
+
+1. Re-emit `warehouse:join`. The server answers with `warehouse:joined`,
+   then `simulation:sync`, then `simulation:status`, then an
+   `orders:changed` with `reason: "sync"`.
+2. Replace robots and obstacles from `simulation:sync` rather than merging
+   them. Merging preserves exactly the stale entries the resync exists to
+   discard - a robot deleted while you were away, for instance, which no
+   future `robots:changed` will ever mention again.
+3. Re-fetch orders over REST when the `orders:changed` arrives. Order
+   documents carry more fields than a tick event does, which is why they
+   are invalidated rather than pushed.
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md#real-time-layer) for how these
-map onto the server-side event bus and the server-owned tick loop.
+map onto the server-side event bus, and
+[`SIMULATION_ARCHITECTURE.md`](./SIMULATION_ARCHITECTURE.md#7-socketio-synchronisation)
+for the full synchronisation model.

@@ -149,12 +149,41 @@ export function useLiveSimulation(warehouseId, grid) {
       setIsRunning(Boolean(payload.running));
       if (payload.running && !startTimeRef.current) startTimeRef.current = Date.now();
     }
-    // A reconnect drops Socket.IO room membership server-side and may have
-    // missed events during the gap - rejoin and re-sync from a fresh REST
-    // snapshot rather than trusting whatever state accumulated so far.
+    /**
+     * The server's authoritative view of this warehouse, sent on every
+     * join and on demand. Robots and obstacles are replaced outright
+     * rather than merged: the point of a resync is that whatever this
+     * client accumulated may be wrong, so folding the two together would
+     * preserve exactly the stale entries it is meant to discard - a robot
+     * deleted while we were disconnected, say, which no future
+     * robots:changed event would ever mention again.
+     */
+    function onSimulationSync(payload) {
+      if (!belongsHere(payload)) return;
+      setRobots(payload.robots || []);
+      setObstacles(payload.obstacles || []);
+      setIsRunning(Boolean(payload.running));
+      setActionError(null);
+    }
+    // A reconnect drops Socket.IO room membership server-side, and every
+    // broadcast made during the gap is gone - they are fire-and-forget, not
+    // a replayable stream. Rejoining triggers the server's resync burst
+    // (simulation:sync + simulation:status + an orders:changed
+    // invalidation), which is what actually restores correct state; the
+    // REST refresh below covers the orders half.
     function onReconnect() {
       socket.emit('warehouse:join', warehouseId);
       refreshSnapshot(warehouseId);
+    }
+    // The warehouse this view is watching was deleted by someone. Clear
+    // rather than keep rendering a simulation that no longer exists.
+    function onWarehouseDeleted(payload) {
+      if (!belongsHere(payload)) return;
+      setRobots([]);
+      setOrders([]);
+      setObstacles([]);
+      setIsRunning(false);
+      setActionError('This warehouse was deleted.');
     }
 
     // The server now refuses socket events it will not serve - a warehouse
@@ -173,6 +202,8 @@ export function useLiveSimulation(warehouseId, grid) {
     socket.on('obstacles:changed', onObstaclesChanged);
     socket.on('notification', onNotification);
     socket.on('simulation:status', onSimulationStatus);
+    socket.on('simulation:sync', onSimulationSync);
+    socket.on('warehouse:deleted', onWarehouseDeleted);
     socket.on('connect', onReconnect);
     socket.on('error:unauthorized', onSocketError);
     socket.on('error:validation', onSocketError);
@@ -186,6 +217,8 @@ export function useLiveSimulation(warehouseId, grid) {
       socket.off('obstacles:changed', onObstaclesChanged);
       socket.off('notification', onNotification);
       socket.off('simulation:status', onSimulationStatus);
+      socket.off('simulation:sync', onSimulationSync);
+      socket.off('warehouse:deleted', onWarehouseDeleted);
       socket.off('connect', onReconnect);
       socket.off('error:unauthorized', onSocketError);
       socket.off('error:validation', onSocketError);

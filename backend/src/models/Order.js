@@ -31,6 +31,12 @@ const orderSchema = new mongoose.Schema(
 );
 
 orderSchema.index({ warehouseId: 1, status: 1 });
+// Reliability phase: releasing a deleted robot's work asks "which orders
+// is this robot carrying?" (services/orderService.js), and recovery asks
+// the same question warehouse-wide. Without this index that is a scan of
+// every order in the warehouse, on a path that runs during a delete
+// request rather than in the background.
+orderSchema.index({ warehouseId: 1, assignedRobot: 1, status: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);
 module.exports.STATUSES = STATUSES;

@@ -50,6 +50,7 @@ is preserved in [`docs/DEVELOPMENT_LOG.md`](./docs/DEVELOPMENT_LOG.md).
 |---|---|
 | [`docs/API.md`](./docs/API.md) | Every REST endpoint and Socket.IO event, with request/response shapes |
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | System diagram, component responsibilities, the tick loop, the real-time event bus, known limitations, security notes |
+| [`docs/SIMULATION_ARCHITECTURE.md`](./docs/SIMULATION_ARCHITECTURE.md) | The simulation core: which system owns which state, the tick mechanism, the per-warehouse concurrency model, the robot and order state machines, restart recovery, Socket.IO resynchronisation, A* cost controls |
 | [`docs/ER_DIAGRAM.md`](./docs/ER_DIAGRAM.md) | MongoDB collections and how they relate |
 | [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) | Step-by-step: MongoDB Atlas → backend (Render/Railway) → frontend (Vercel/Netlify) |
 | [`docs/DEVELOPMENT_LOG.md`](./docs/DEVELOPMENT_LOG.md) | The full milestone-by-milestone build history |
@@ -114,7 +115,8 @@ warehouse-robot-simulation/
 │   ├── vite.config.js
 │   ├── .env.example
 │   └── package.json
-└── docs/                   # API.md, ARCHITECTURE.md, ER_DIAGRAM.md, DEPLOYMENT.md, DEVELOPMENT_LOG.md
+└── docs/                   # API.md, ARCHITECTURE.md, SIMULATION_ARCHITECTURE.md,
+                            #   ER_DIAGRAM.md, DEPLOYMENT.md, DEVELOPMENT_LOG.md, SECURITY.md
 ```
 
 ## Running locally

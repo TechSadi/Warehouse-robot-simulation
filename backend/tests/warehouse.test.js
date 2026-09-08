@@ -21,11 +21,25 @@ jest.mock('../src/models/Warehouse', () => {
   return mockModel;
 });
 
+// Deleting a warehouse now cascades to its dependent collections - see
+// the doc comment on `remove` in controllers/warehouse.controller.js.
+jest.mock('../src/models/Robot', () => ({ deleteMany: jest.fn(), STATUSES: ['idle', 'moving', 'charging', 'error'] }));
+jest.mock('../src/models/Order', () => ({ deleteMany: jest.fn(), STATUSES: [], PRIORITIES: [] }));
+jest.mock('../src/models/Statistics', () => ({ deleteMany: jest.fn() }));
+jest.mock('../src/models/Log', () => ({ deleteMany: jest.fn(), LEVELS: ['info', 'warn', 'error'] }));
+
 const Warehouse = require('../src/models/Warehouse');
+const Robot = require('../src/models/Robot');
+const Order = require('../src/models/Order');
+const Statistics = require('../src/models/Statistics');
+const Log = require('../src/models/Log');
 const app = require('../src/app');
 
 beforeEach(() => {
   jest.clearAllMocks();
+  for (const model of [Robot, Order, Statistics, Log]) {
+    model.deleteMany.mockResolvedValue({ deletedCount: 0 });
+  }
   // The ownership middleware resolves every :id through findOne({_id, ownerId}).
   mockOwnership(Warehouse);
 });
@@ -98,6 +112,39 @@ describe('DELETE /api/warehouses/:id', () => {
     Warehouse.findOneAndDelete.mockResolvedValue({ _id: VALID_ID });
     const res = await authed(request(app).delete(`/api/warehouses/${VALID_ID}`));
     expect(res.status).toBe(204);
+  });
+
+  it('cascades to every collection that hangs off the warehouse', async () => {
+    // These documents are only reachable *through* their warehouse (see
+    // middleware/authorize.js), so leaving them behind makes them
+    // permanently invisible and permanently undeletable.
+    Warehouse.findOneAndDelete.mockResolvedValue({ _id: VALID_ID });
+
+    const res = await authed(request(app).delete(`/api/warehouses/${VALID_ID}`));
+
+    expect(res.status).toBe(204);
+    for (const model of [Robot, Order, Statistics, Log]) {
+      expect(model.deleteMany).toHaveBeenCalledWith({ warehouseId: VALID_ID });
+    }
+  });
+
+  it('deletes the children before the parent, so a partial failure is retryable', async () => {
+    // No transactions here (they need a replica set), so the ordering is
+    // the guarantee: if this dies half-way, the warehouse still exists and
+    // repeating the request finishes the job.
+    const calls = [];
+    Robot.deleteMany.mockImplementation(async () => {
+      calls.push('children');
+      return { deletedCount: 0 };
+    });
+    Warehouse.findOneAndDelete.mockImplementation(async () => {
+      calls.push('warehouse');
+      return { _id: VALID_ID };
+    });
+
+    await authed(request(app).delete(`/api/warehouses/${VALID_ID}`));
+
+    expect(calls).toEqual(['children', 'warehouse']);
   });
 });
 

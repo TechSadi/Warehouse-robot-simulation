@@ -48,6 +48,12 @@ picks its next task," not two versions that could drift apart.
 
 ## The tick loop
 
+> The simulation core - state ownership, the concurrency model, the two
+> state machines, restart recovery, and Socket.IO resynchronisation - is
+> documented in full in
+> [`SIMULATION_ARCHITECTURE.md`](./SIMULATION_ARCHITECTURE.md). This
+> section is the short version.
+
 A "tick" is one simulation step: move every robot, process any
 pickup/delivery transitions that just happened, dispatch newly-idle
 robots onto pending orders. `tickRunner.runTick(warehouseId, deltaSeconds)`
@@ -70,6 +76,14 @@ Every changed robot snapshot from a tick is persisted in one
 see [`backend/scripts/benchmark.js`](../backend/scripts/benchmark.js) for
 measured throughput at the target scale of 50 simultaneous robots.
 
+Both entry points, and every other operation that mutates one warehouse's
+simulation, run through that warehouse's serialized queue
+(`services/warehouseLock.js`), so no two of them are ever in flight at
+once. Automatic ticks that arrive while one is still running are dropped
+rather than queued, so a slow tick cannot build a backlog that later
+replays as a burst - see
+[the concurrency model](./SIMULATION_ARCHITECTURE.md#3-concurrency-model).
+
 ## Real-time layer
 
 ```mermaid
@@ -90,7 +104,7 @@ sequenceDiagram
 module (`tickRunner`, `orderService`, the warehouse/robot controllers)
 emits into. `sockets/index.js` is the *only* thing that listens,
 translating each event into a broadcast to the matching warehouse's room.
-This indirection is why the 265 backend tests never need to know
+This indirection is why most of the backend suite never needs to know
 Socket.IO exists: they mock the services directly and never load the
 sockets module, so emitting into an unlistened bus is a no-op. See the
 event catalogue in [`API.md`](./API.md#socketio-events).
@@ -106,9 +120,17 @@ event catalogue in [`API.md`](./API.md#socketio-events).
   per-node snapshot built at all (a 54.8x speedup on a search exploring
   ~1,800 nodes - see the development log).
 - **`findPathWithTrace`** drains it while collecting every yielded
-  snapshot (`trace: true`, `emitSteps` left at its default), capped at
-  400 recorded frames regardless of how long the search actually runs.
-  This is what powers the AI Visualisation Panel's step-by-step scrubber.
+  snapshot (`trace: true`), capped at 400 recorded frames regardless of
+  how long the search actually runs. This is what powers the AI
+  Visualisation Panel's step-by-step scrubber. The cap is now passed into
+  the generator as `maxEmitSteps`, so snapshots past it are never built
+  rather than built and discarded.
+
+Start, goal and grid dimensions are validated before the search runs -
+a fractional, non-finite or out-of-bounds coordinate names a cell this
+grid search can never reach, and is answered in constant time instead of
+after exhausting the iteration ceiling. See
+[A* architecture](./SIMULATION_ARCHITECTURE.md#8-a-architecture).
 
 Both paths share the same search - there's no risk of the "fast" and
 "visualized" versions of A* disagreeing, because they're the same code

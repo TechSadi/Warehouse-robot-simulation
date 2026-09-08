@@ -10,6 +10,7 @@ const {
   optionalDeltaSeconds,
 } = require('./socketValidation');
 const { findOwnedWarehouse } = require('../middleware/authorize');
+const simulationManager = require('../services/simulationManager');
 
 /**
  * Attaches Socket.IO to the given HTTP server and wires up Milestone 11's
@@ -17,7 +18,10 @@ const { findOwnedWarehouse } = require('../middleware/authorize');
  *
  *  - Clients join a per-warehouse room (`warehouse:<id>`) via
  *    `warehouse:join` to receive that warehouse's robot/order/obstacle/
- *    notification events, and leave it via `warehouse:leave`.
+ *    notification events, and leave it via `warehouse:leave`. Joining
+ *    always answers with a full `simulation:sync` snapshot plus the
+ *    current `simulation:status`, and `simulation:sync` can be requested
+ *    again at any time - see the note on resynchronisation below.
  *  - `simulation:start` / `simulation:stop` control one server-owned tick
  *    interval per warehouse (tickLoopManager.js), shared by every client
  *    watching that warehouse.
@@ -44,6 +48,19 @@ const { findOwnedWarehouse } = require('../middleware/authorize');
  *     Checking at join time alone would leave `simulation:start` for an
  *     unjoined warehouse wide open - starting someone else's simulation
  *     does not require being able to see it.
+ *
+ * Resynchronisation (added in the reliability phase). Socket.IO reconnects
+ * transparently, and a client that reconnects has *not* stayed
+ * synchronised: room membership is dropped server-side on disconnect, and
+ * every robot/order/obstacle event broadcast during the gap is gone - they
+ * are fire-and-forget broadcasts, not a replayable stream. The previous
+ * design left the client silently displaying whatever state it had when
+ * the connection dropped, including a Start/Stop button reflecting a
+ * simulation status that may have changed twice since. So: joining a room
+ * (which a reconnecting client redoes) always returns an authoritative
+ * snapshot, `simulation:sync` can be asked for explicitly, and
+ * `simulation:status` is sent to the requester on every start/stop even
+ * when the call changed nothing.
  */
 function initSockets(httpServer) {
   const io = new Server(httpServer, {
@@ -110,9 +127,41 @@ function initSockets(httpServer) {
       });
     }
 
-    guarded('warehouse:join', ({ warehouseId }) => {
+    /** The authoritative current state of one warehouse's simulation, as
+     * the server sees it right now. Robots come from the live engine
+     * rather than from Mongo so the client gets sub-tick-accurate
+     * positions, and `running` comes from the tick loop rather than from
+     * whatever the client last assumed. Orders are deliberately not
+     * included: they are fetched over REST (see the note on
+     * `orders:changed` in events/simulationEvents.js), and `reason: 'sync'`
+     * below is what tells the client to do that. */
+    async function buildSync(warehouseId) {
+      const engine = await simulationManager.getEngine(warehouseId);
+      return {
+        warehouseId,
+        running: tickLoopManager.isRunning(warehouseId),
+        robots: engine ? engine.getAllRobots() : [],
+        obstacles: engine ? engine.getObstacles() : [],
+        serverTime: new Date().toISOString(),
+      };
+    }
+
+    async function sendSync(warehouseId) {
+      socket.emit('simulation:sync', await buildSync(warehouseId));
+      socket.emit('simulation:status', tickLoopManager.status(warehouseId));
+      // The client refetches orders over REST on this signal, which is how
+      // it recovers order state it may have missed while disconnected.
+      socket.emit('orders:changed', { warehouseId, reason: 'sync' });
+    }
+
+    guarded('warehouse:join', async ({ warehouseId }) => {
       socket.join(room(warehouseId));
       socket.emit('warehouse:joined', { warehouseId });
+      await sendSync(warehouseId);
+    });
+
+    guarded('simulation:sync', async ({ warehouseId }) => {
+      await sendSync(warehouseId);
     });
 
     guarded('warehouse:leave', ({ warehouseId }) => {
@@ -120,13 +169,20 @@ function initSockets(httpServer) {
       tickLoopManager.stopIfIdle(io, warehouseId);
     });
 
+    // Both of these are idempotent, and both answer the requester
+    // directly even when they changed nothing. A second `simulation:start`
+    // is not an error - it means "I want this running", and it already is
+    // - but a client that hears nothing back cannot tell that from a
+    // request that was dropped.
     guarded('simulation:start', ({ warehouseId, payload }) => {
       const deltaSeconds = optionalDeltaSeconds(payload);
-      tickLoopManager.start(io, warehouseId, deltaSeconds);
+      const { started } = tickLoopManager.start(io, warehouseId, deltaSeconds);
+      socket.emit('simulation:status', { ...tickLoopManager.status(warehouseId), changed: started });
     });
 
     guarded('simulation:stop', ({ warehouseId }) => {
-      tickLoopManager.stop(io, warehouseId);
+      const { stopped } = tickLoopManager.stop(io, warehouseId);
+      socket.emit('simulation:status', { warehouseId, running: false, changed: stopped });
     });
 
     // Socket.IO removes a disconnecting socket from its rooms before the
@@ -164,6 +220,16 @@ function initSockets(httpServer) {
   });
   simulationEvents.on('notification', (payload) => {
     io.to(room(payload.warehouseId)).emit('notification', payload);
+  });
+  // A deleted warehouse must not keep a tick loop running against an
+  // engine that no longer has anything to advance, and the clients still
+  // in its room need to be told rather than left watching a frozen view.
+  // Emitted by warehouse.controller.js, which has no reference to the
+  // socket layer - same indirection as every other event here.
+  simulationEvents.on('warehouse:deleted', ({ warehouseId }) => {
+    tickLoopManager.stop(io, warehouseId);
+    io.to(room(warehouseId)).emit('warehouse:deleted', { warehouseId });
+    io.socketsLeave(room(warehouseId));
   });
 
   initSockets.tickLoopManager = tickLoopManager;

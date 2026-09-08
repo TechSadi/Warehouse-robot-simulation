@@ -41,8 +41,11 @@ router.post(
   [
     body('name').trim().notEmpty().withMessage('name is required').isLength({ max: 60 }),
     body('warehouseId').isMongoId().withMessage('warehouseId must be a valid Mongo ObjectId'),
-    body('position.x').optional().isFloat({ min: 0, max: 79 }),
-    body('position.y').optional().isFloat({ min: 0, max: 79 }),
+    // Integer, not float: a robot is spawned into a cell (see the
+    // controller). Fractional positions belong to the simulation, which
+    // produces them while a robot is between two cells.
+    body('position.x').optional().isInt({ min: 0, max: 79 }).withMessage('position.x must be a whole cell index'),
+    body('position.y').optional().isInt({ min: 0, max: 79 }).withMessage('position.y must be a whole cell index'),
     body('speed').optional().isFloat({ min: 0, max: 20 }),
     body('battery').optional().isFloat({ min: 0, max: 100 }),
   ],

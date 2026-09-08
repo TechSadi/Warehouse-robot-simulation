@@ -46,6 +46,10 @@ const EVENT_LIMITS = {
   'simulation:start': { capacity: 10, refillPerSecond: 0.5 },
   'simulation:stop': { capacity: 10, refillPerSecond: 0.5 },
   'simulation:tick': { capacity: 10, refillPerSecond: 2 },
+  // Resynchronisation after a reconnect. Cheap (one engine read), but a
+  // client that loops it is still asking the server to serialise a full
+  // fleet snapshot each time.
+  'simulation:sync': { capacity: 10, refillPerSecond: 1 },
   'orders:generate': { capacity: 5, refillPerSecond: 0.2 },
   'orders:dispatch': { capacity: 10, refillPerSecond: 0.5 },
   // Anything not named above shares one modest default budget, so a new

@@ -14,7 +14,8 @@ const { io: ioClient } = require('socket.io-client');
 process.env.TICK_INTERVAL_MS = '60';
 
 jest.mock('../../src/services/tickRunner', () => ({
-  runTick: jest.fn().mockResolvedValue(null),
+  // The loop drives `runAutoTick` (skip-if-busy), not `runTick`.
+  runAutoTick: jest.fn().mockResolvedValue({ skipped: false, value: null }),
 }));
 
 jest.mock('../../src/models/Warehouse', () => ({
@@ -25,7 +26,7 @@ jest.mock('../../src/models/Warehouse', () => ({
   CELL_TYPES: ['shelf', 'charging', 'obstacle', 'dock'],
 }));
 
-const { runTick } = require('../../src/services/tickRunner');
+const { runAutoTick } = require('../../src/services/tickRunner');
 const Warehouse = require('../../src/models/Warehouse');
 const simulationEvents = require('../../src/events/simulationEvents');
 const initSockets = require('../../src/sockets');
@@ -195,7 +196,7 @@ describe('event authorization for expensive operations', () => {
     expect((await denied).event).toBe('simulation:start');
 
     await wait(150);
-    expect(runTick).not.toHaveBeenCalled();
+    expect(runAutoTick).not.toHaveBeenCalled();
     client.disconnect();
   });
 
@@ -206,7 +207,7 @@ describe('event authorization for expensive operations', () => {
     await joined;
     owner.emit('simulation:start', { warehouseId: OTHER_WAREHOUSE, deltaSeconds: 0.06 });
     await wait(120);
-    const callsWhileRunning = runTick.mock.calls.length;
+    const callsWhileRunning = runAutoTick.mock.calls.length;
     expect(callsWhileRunning).toBeGreaterThanOrEqual(1);
 
     const intruder = await connected(connect({ auth: { token: TOKEN_A } }));
@@ -215,7 +216,7 @@ describe('event authorization for expensive operations', () => {
     await denied;
 
     await wait(120);
-    expect(runTick.mock.calls.length).toBeGreaterThan(callsWhileRunning); // still running
+    expect(runAutoTick.mock.calls.length).toBeGreaterThan(callsWhileRunning); // still running
 
     owner.emit('simulation:stop', { warehouseId: OTHER_WAREHOUSE });
     await wait(30);

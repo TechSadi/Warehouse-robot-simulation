@@ -26,7 +26,12 @@ jest.mock('../src/services/simulationManager', () => ({
 jest.mock('../src/services/orderService', () => ({
   generateOrders: jest.fn(),
   dispatchPendingOrders: jest.fn(),
+  // The tick path calls the already-locked variant: it runs inside the
+  // warehouse lock and re-entering it would deadlock.
+  dispatchPendingOrdersLocked: jest.fn(),
   processTickEvents: jest.fn(),
+  releaseOrders: jest.fn(),
+  releaseOrdersForRobot: jest.fn(),
 }));
 
 jest.mock('../src/models/Log', () => ({
@@ -72,6 +77,7 @@ beforeEach(() => {
   simulationManager.persistRobots.mockResolvedValue();
   orderService.processTickEvents.mockResolvedValue();
   orderService.dispatchPendingOrders.mockResolvedValue([]);
+  orderService.dispatchPendingOrdersLocked.mockResolvedValue([]);
 });
 
 function fakeCoordinator(overrides = {}) {
@@ -208,7 +214,7 @@ describe('POST /api/warehouses/:id/tick', () => {
     const coordinator = fakeCoordinator({ processTick: jest.fn().mockReturnValue(orderEvents) });
     simulationManager.getEngine.mockResolvedValue(engine);
     simulationManager.getOrderCoordinator.mockResolvedValue(coordinator);
-    orderService.dispatchPendingOrders.mockResolvedValue([{ orderId: 'o2', robotId: 'r2' }]);
+    orderService.dispatchPendingOrdersLocked.mockResolvedValue([{ orderId: 'o2', robotId: 'r2' }]);
 
     const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({ deltaSeconds: 0.5 }));
 
@@ -217,7 +223,7 @@ describe('POST /api/warehouses/:id/tick', () => {
     expect(engine.tick).toHaveBeenCalledWith(0.5);
     expect(coordinator.processTick).toHaveBeenCalledWith(changed);
     expect(orderService.processTickEvents).toHaveBeenCalledWith(WAREHOUSE_ID, orderEvents);
-    expect(orderService.dispatchPendingOrders).toHaveBeenCalledWith(WAREHOUSE_ID);
+    expect(orderService.dispatchPendingOrdersLocked).toHaveBeenCalledWith(WAREHOUSE_ID);
     expect(res.body.data.orderEvents).toEqual(orderEvents);
     expect(res.body.data.dispatched).toEqual([{ orderId: 'o2', robotId: 'r2' }]);
     expect(simulationManager.persistRobots).toHaveBeenCalledWith(changed);

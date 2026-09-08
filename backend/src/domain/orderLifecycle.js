@@ -36,14 +36,34 @@ const STATUSES = [
 
 const TERMINAL_STATUSES = ['delivered', 'cancelled'];
 
+/**
+ * Every state in which an order is the responsibility of some robot. These
+ * are exactly the states whose progress depends on runtime state that does
+ * not survive a restart or an engine reload (the OrderCoordinator's
+ * in-memory assignment map), so they are also exactly the states the
+ * recovery path has to requeue - see
+ * `simulationManager.reconcileWarehouse`.
+ */
+const IN_FLIGHT_STATUSES = ['assigned', 'picking_up', 'picked_up', 'delivering'];
+
 const TRANSITIONS = {
   pending: ['assigned', 'cancelled'],
   // Back to `pending` is an explicit un-assign (the robot broke down, or a
   // dispatch is being undone) - a legal move, not a rewind of history.
   assigned: ['picking_up', 'picked_up', 'pending', 'cancelled'],
   picking_up: ['picked_up', 'pending', 'cancelled'],
-  picked_up: ['delivering', 'delivered', 'cancelled'],
-  delivering: ['delivered', 'cancelled'],
+  // `picked_up -> pending` and `delivering -> pending` are the *release*
+  // edges, added in the reliability phase. Before them, an order whose
+  // robot broke down mid-delivery, or whose runtime assignment was lost to
+  // a restart or an engine reload, had nowhere legal to go: it was not
+  // terminal, so it stayed `picked_up` forever, pointing at a robot that
+  // was no longer carrying it, and the dispatcher (which only ever looks
+  // at `pending`) could never pick it up again. Returning it to the
+  // dispatchable pool is a release of a claim, not a rewind of a delivery
+  // - `deliveredAt` is only ever written by an actual delivery, and
+  // `delivered` remains terminal and unreachable from here.
+  picked_up: ['delivering', 'delivered', 'pending', 'cancelled'],
+  delivering: ['delivered', 'pending', 'cancelled'],
   delivered: [],
   cancelled: [],
 };
@@ -101,6 +121,10 @@ function buildTransitionUpdate(from, to, { now = new Date() } = {}) {
   if (to === 'pending') {
     update.assignedRobot = null;
     update.assignedAt = null;
+    // A released order has not been picked up by anyone any more: leaving
+    // `pickedUpAt` set would have the next robot's delivery report a
+    // pickup that happened before it was even assigned.
+    update.pickedUpAt = null;
   }
 
   return update;
@@ -126,6 +150,7 @@ function predecessorsOf(to) {
 module.exports = {
   STATUSES,
   TERMINAL_STATUSES,
+  IN_FLIGHT_STATUSES,
   TRANSITIONS,
   STATUS_TIMESTAMP_FIELD,
   OrderTransitionError,

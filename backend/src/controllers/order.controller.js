@@ -5,6 +5,7 @@ const { parsePagination, buildMeta } = require('../utils/pagination');
 const { ApiError } = require('../middleware/errorHandler');
 const { pick } = require('../middleware/dto');
 const { buildTransitionUpdate, isTerminal } = require('../domain/orderLifecycle');
+const orderService = require('../services/orderService');
 const simulationEvents = require('../events/simulationEvents');
 
 /**
@@ -146,6 +147,18 @@ const update = asyncHandler(async (req, res) => {
   );
   if (!updated) throw new ApiError(404, 'Order not found');
 
+  // Cancelling or un-assigning an order has to reach the *simulation*, not
+  // just the document. The OrderCoordinator's assignment is what keeps a
+  // robot driving toward this order's pickup or delivery point; leaving it
+  // in place meant a cancelled order still had a robot working it, burning
+  // battery and occupying aisles for a delivery whose own record said it
+  // was cancelled - and on arrival the robot reported a pickup that the
+  // lifecycle filter then (correctly) refused, so the assignment simply
+  // leaked.
+  if (updated.status === 'cancelled' || updated.status === 'pending') {
+    await orderService.releaseOrders(warehouse._id, [updated._id], { restoreToPending: false });
+  }
+
   simulationEvents.emit('orders:changed', { warehouseId: String(warehouse._id), reason: 'updated' });
   res.json({ success: true, data: updated });
 });
@@ -164,6 +177,9 @@ async function resolveAssignedRobot(assignedRobot, warehouse) {
 const remove = asyncHandler(async (req, res) => {
   const order = await Order.findByIdAndDelete(req.resource._id);
   if (!order) throw new ApiError(404, 'Order not found');
+  // Same reason as the cancellation path above: there is no document left
+  // to return to `pending`, but the robot must stop working for it.
+  await orderService.releaseOrders(order.warehouseId, [order._id], { restoreToPending: false });
   simulationEvents.emit('orders:changed', {
     warehouseId: String(order.warehouseId),
     reason: 'deleted',

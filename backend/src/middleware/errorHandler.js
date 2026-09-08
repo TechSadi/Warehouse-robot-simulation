@@ -33,6 +33,9 @@ const ROBOT_ENGINE_ERROR_STATUS = {
   INVALID_ARGUMENT: 400,
   INVALID_TRANSITION: 409,
   NOT_AT_CHARGING_STATION: 409,
+  CELL_OCCUPIED: 409,
+  TASK_QUEUE_FULL: 409,
+  DUPLICATE_OBSTACLE: 409,
 };
 
 /** Final error-formatting middleware. Must be registered last. */
