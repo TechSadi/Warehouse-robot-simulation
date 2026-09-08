@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useAuth } from '../../state/useAuth.jsx';
 import './TopNav.css';
 
 const STATUS_COPY = {
@@ -8,6 +9,7 @@ const STATUS_COPY = {
 };
 
 export default function TopNav({ connectionStatus, onShowShortcuts }) {
+  const { user, signOut } = useAuth();
   const [now, setNow] = useState(() => new Date());
 
   useEffect(() => {
@@ -44,6 +46,16 @@ export default function TopNav({ connectionStatus, onShowShortcuts }) {
         <time className="top-nav__clock readout" dateTime={now.toISOString()}>
           {now.toLocaleTimeString('en-US', { hour12: false })}
         </time>
+        {user && (
+          <div className="top-nav__account">
+            <span className="top-nav__user" title={user.email}>
+              {user.name || user.email}
+            </span>
+            <button type="button" className="top-nav__signout-btn" onClick={signOut}>
+              Sign out
+            </button>
+          </div>
+        )}
       </div>
     </header>
   );

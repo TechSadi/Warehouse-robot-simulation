@@ -197,10 +197,14 @@ post-deploy checklist.
 
 ## Known limitations
 
-This is a demo/portfolio project, not production software handling real
-data - see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#known-limitations)
-and its [security notes](./docs/ARCHITECTURE.md#security-notes) for the
-full, honest list (no authentication, no rate limiting, a couple of
-narrow known gaps in edge cases) before using this as a foundation for
-anything that needs to handle real data or be exposed publicly beyond a
-portfolio demo.
+This is a demo/portfolio project - see
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#known-limitations) for the
+full, honest list of what it does and does not do.
+
+It is now a multi-user application: accounts, per-user data isolation,
+resource-level authorization, authenticated Socket.IO, rate limiting and
+CSRF protection all landed in the security phase.
+[`docs/SECURITY.md`](./docs/SECURITY.md) documents the whole posture
+including the threat model and what remains out of scope - notably no
+email verification, no password reset, no MFA, and no sharing between
+accounts.

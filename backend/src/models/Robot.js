@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
-
-const STATUSES = ['idle', 'moving', 'charging', 'error'];
+// Single source of truth for the status values and the legal moves between
+// them - shared with the simulation engine and the REST layer so neither
+// can drift into accepting a state the other rejects.
+const { STATUSES } = require('../domain/robotLifecycle');
 
 // Movement/task-queue behavior lands in Milestone 5 (Robot Engine); this
 // schema just needs to hold the fields that milestone will read and write,

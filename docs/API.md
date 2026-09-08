@@ -34,9 +34,54 @@ at 100, defaults to 20) and return the `meta` block shown above.
 **IDs.** Every `:id` is a MongoDB ObjectId. An invalid one returns `400`,
 not `404`.
 
-**Auth.** None. This is a demo/portfolio project - see the
-[Architecture doc's security note](./ARCHITECTURE.md#security-notes)
-before using this as a template for anything handling real data.
+**Auth.** Required. Every endpoint except `GET /health` and `/auth/*`
+needs a session; without one they return `401`. Sign in via
+`POST /auth/login`, which sets httpOnly cookies the browser then sends
+automatically - browser clients need `credentials: 'include'` on every
+request and must echo the readable `wrs_csrf` cookie in an `X-CSRF-Token`
+header on any non-GET. Non-browser clients may send
+`Authorization: Bearer <access token>` instead, which is exempt from CSRF.
+
+**Authorization.** Resources are owned: every robot, order, obstacle,
+statistic and log belongs to a warehouse, and every warehouse belongs to
+one user. Requesting another user's resource returns `404`, identical to
+one that never existed - deliberately, so ids cannot be enumerated. List
+endpoints are scoped to the caller.
+
+Full details in [`SECURITY.md`](./SECURITY.md).
+
+---
+
+## Authentication
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/auth/register` | Create an account and sign in. `{ email, password, name? }` |
+| POST | `/auth/login` | Sign in. `{ email, password }` |
+| POST | `/auth/refresh` | Rotate the session using the refresh cookie |
+| POST | `/auth/logout` | Revoke this session |
+| POST | `/auth/logout-all` | Revoke every session for the user |
+| GET | `/auth/me` | The current user |
+
+Registration requires a password of at least 12 characters containing
+upper case, lower case, and a digit. `role` and every other privileged
+field are ignored if sent.
+
+```json
+// POST /auth/login -> 200
+{
+  "success": true,
+  "data": {
+    "user": { "id": "...", "email": "you@example.com", "name": "", "role": "user" },
+    "csrfToken": "...",
+    "expiresIn": 900
+  }
+}
+```
+
+Login answers `401 "Invalid email or password"` whether or not the account
+exists. Repeated failures are rate-limited per IP and lock the account for
+15 minutes.
 
 ---
 
@@ -214,12 +259,35 @@ triggers autonomous charging-station routing instead - see the Milestone
 | PUT | `/orders/:id` | Update |
 | DELETE | `/orders/:id` | Delete |
 
-`status`: `pending` → `assigned` → `picked_up` → `delivered` (or
-`cancelled` at any point). `priority`: `low` | `normal` | `high` |
-`urgent`. In normal use, orders are created via
-`POST /warehouses/:id/orders/generate` and progress automatically as the
-simulation ticks; this CRUD surface exists for direct inspection/testing
-and manual scripting.
+**Lifecycle.** `status` follows a state machine, not a free enum:
+
+```
+pending -> assigned -> picking_up -> picked_up -> delivering -> delivered
+```
+
+with `cancelled` reachable from any non-terminal state, and `delivered`
+and `cancelled` terminal. The simulation advances a leg at a time
+(`assigned -> picked_up -> delivered`), which are legal forward moves
+along the same chain; the in-transit states are there for clients driving
+an order by hand.
+
+An illegal move returns `409` with
+`details.code: "INVALID_ORDER_TRANSITION"` - `pending -> delivered` and
+`delivered -> pending` are both rejected, as is any edit to an order that
+has already reached a terminal state. The REST API and the simulation
+engine share one implementation of these rules
+([`SECURITY.md`](./SECURITY.md#4-domain-state-protection)).
+
+`status` is **not** accepted on create - every order starts `pending`.
+Neither are `assignedRobot` or any `*At` timestamp: those are recorded by
+the server when the transition happens, and sending one returns `422`.
+Pickup and delivery coordinates can only be changed while an order is
+still `pending`.
+
+`priority`: `low` | `normal` | `high` | `urgent`. In normal use, orders
+are created via `POST /warehouses/:id/orders/generate` and progress
+automatically as the simulation ticks; this CRUD surface exists for direct
+inspection/testing and manual scripting.
 
 ```json
 // POST /orders
@@ -275,11 +343,16 @@ Logs panel in the dashboard (Milestone 13) is a thin client over this.
 
 ## Socket.IO events
 
-Connect with `path: '/socket.io'`. Every event below is scoped to a
-warehouse "room" - join one to receive its events, and note that no
-authentication gates this: anyone who knows a warehouse's id can join its
-room. See the
-[Architecture doc's security note](./ARCHITECTURE.md#security-notes).
+Connect with `path: '/socket.io'` and `withCredentials: true` (or pass
+`auth: { token }` for a non-browser client). **The handshake is
+authenticated**: an unauthenticated connection is refused with
+`UNAUTHENTICATED` rather than connecting and receiving nothing.
+
+Every event below is scoped to a warehouse "room", and joining one
+requires *owning* that warehouse - as does every other warehouse-scoped
+event, checked individually rather than only at join time. Events are also
+validated and rate-limited per socket. See
+[`SECURITY.md`](./SECURITY.md#5-socketio-security).
 
 ### Client → server
 
@@ -290,11 +363,24 @@ room. See the
 | `simulation:start` | `{ warehouseId, deltaSeconds? }` | Start (or join) that warehouse's server-owned tick loop |
 | `simulation:stop` | `{ warehouseId }` | Stop it |
 
+### Server → client (errors)
+
+| Event | Payload | When |
+|---|---|---|
+| `error:unauthorized` | `{ event, message }` | The caller does not own the warehouse named in the payload. The message is deliberately identical to a nonexistent warehouse's. |
+| `error:validation` | `{ event, message }` | Malformed payload - bad id, out-of-range `deltaSeconds`, wrong type |
+| `error:rate_limit` | `{ event, message }` | Too many of this event on this socket |
+| `error:server` | `{ event, message }` | The handler failed |
+
+An `emit` has nothing to reject, so these arrive as events; a client that
+does not listen for them sees a silent no-op.
+
 ### Server → client
 
 | Event | Payload | When |
 |---|---|---|
-| `server:welcome` | `{ message, timestamp }` | On connect |
+| `server:welcome` | `{ message, userId, timestamp }` | On connect |
+| `warehouse:joined` | `{ warehouseId }` | A `warehouse:join` was authorized and took effect |
 | `robots:changed` | `{ warehouseId, robots: [...] }` | One or more robots moved or changed state - upsert by `id`, this may be a partial list |
 | `robots:removed` | `{ warehouseId, robotId }` | A robot was deleted |
 | `orders:changed` | `{ warehouseId, reason, ... }` | An invalidation signal, not a diff - re-fetch orders for this warehouse when you see it |

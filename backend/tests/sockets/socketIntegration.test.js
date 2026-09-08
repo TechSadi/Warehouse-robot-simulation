@@ -7,9 +7,21 @@ jest.mock('../../src/services/tickRunner', () => ({
   runTick: jest.fn().mockResolvedValue(null),
 }));
 
+// Room membership is ownership-checked against this model on every
+// warehouse-scoped event - see sockets/index.js.
+jest.mock('../../src/models/Warehouse', () => ({
+  find: jest.fn(),
+  findById: jest.fn(),
+  findOne: jest.fn(),
+  countDocuments: jest.fn(),
+  CELL_TYPES: ['shelf', 'charging', 'obstacle', 'dock'],
+}));
+
 const { runTick } = require('../../src/services/tickRunner');
+const Warehouse = require('../../src/models/Warehouse');
 const simulationEvents = require('../../src/events/simulationEvents');
 const initSockets = require('../../src/sockets');
+const { tokenFor, makeUser, USER_A_ID } = require('../helpers/auth');
 
 const WAREHOUSE_A = '507f1f77bcf86cd799439022';
 const WAREHOUSE_B = '507f1f77bcf86cd799439033';
@@ -18,10 +30,19 @@ let httpServer;
 let io;
 let port;
 
-/** Connects a client socket and resolves once it's actually connected. */
-function connectClient() {
+const TOKEN = tokenFor(makeUser(USER_A_ID));
+
+/** Connects an authenticated client socket and resolves once it's
+ * actually connected. The handshake now requires a valid access token
+ * (sockets/socketAuth.js); the unauthenticated and cross-tenant cases are
+ * covered in tests/security/socket.test.js. */
+function connectClient(token = TOKEN) {
   return new Promise((resolve, reject) => {
-    const client = ioClient(`http://127.0.0.1:${port}`, { path: '/socket.io', forceNew: true });
+    const client = ioClient(`http://127.0.0.1:${port}`, {
+      path: '/socket.io',
+      forceNew: true,
+      auth: { token },
+    });
     client.on('connect', () => resolve(client));
     client.on('connect_error', reject);
   });
@@ -54,6 +75,13 @@ afterAll((done) => {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // The test user owns both warehouses.
+  Warehouse.findOne.mockImplementation((filter = {}) => {
+    const id = String(filter._id);
+    const owns = String(filter.ownerId) === USER_A_ID;
+    if (!owns || (id !== WAREHOUSE_A && id !== WAREHOUSE_B)) return Promise.resolve(null);
+    return Promise.resolve({ _id: id, ownerId: USER_A_ID, rows: 20, cols: 20, cells: [] });
+  });
 });
 
 describe('connection', () => {
@@ -62,7 +90,11 @@ describe('connection', () => {
     // 'connect' first - the server emits server:welcome synchronously from
     // its own 'connection' handler, so listening only after our 'connect'
     // promise resolves is a race that can miss it.
-    const client = ioClient(`http://127.0.0.1:${port}`, { path: '/socket.io', forceNew: true });
+    const client = ioClient(`http://127.0.0.1:${port}`, {
+      path: '/socket.io',
+      forceNew: true,
+      auth: { token: TOKEN },
+    });
     const welcome = await nextEvent(client, 'server:welcome');
     expect(welcome.message).toMatch(/warehouse simulation server/i);
     client.disconnect();
@@ -73,9 +105,13 @@ describe('warehouse rooms', () => {
   it('delivers a robots:changed event only to clients that joined that warehouse', async () => {
     const watcherA = await connectClient();
     const watcherB = await connectClient();
+    const joinedA = nextEvent(watcherA, 'warehouse:joined');
+    const joinedB = nextEvent(watcherB, 'warehouse:joined');
     watcherA.emit('warehouse:join', WAREHOUSE_A);
     watcherB.emit('warehouse:join', WAREHOUSE_B);
-    await wait(50); // let the joins land server-side
+    // The join is now asynchronous (it does an ownership lookup), so wait
+    // for the server's acknowledgement rather than a fixed delay.
+    await Promise.all([joinedA, joinedB]);
 
     const receivedByA = nextEvent(watcherA, 'robots:changed');
     let receivedByB = false;
@@ -102,8 +138,9 @@ describe('warehouse rooms', () => {
 
   it('forwards robots:removed, obstacles:changed, orders:changed, and notification events', async () => {
     const client = await connectClient();
+    const joined = nextEvent(client, 'warehouse:joined');
     client.emit('warehouse:join', WAREHOUSE_A);
-    await wait(50);
+    await joined;
 
     const removed = nextEvent(client, 'robots:removed');
     simulationEvents.emit('robots:removed', { warehouseId: WAREHOUSE_A, robotId: 'r1' });
@@ -137,8 +174,9 @@ describe('warehouse rooms', () => {
 describe('simulation:start / simulation:stop', () => {
   it('starts a server-side tick loop that calls runTick repeatedly and broadcasts simulation:status', async () => {
     const client = await connectClient();
+    const joined = nextEvent(client, 'warehouse:joined');
     client.emit('warehouse:join', WAREHOUSE_A);
-    await wait(30);
+    await joined;
 
     const statusOn = nextEvent(client, 'simulation:status');
     client.emit('simulation:start', { warehouseId: WAREHOUSE_A, deltaSeconds: 0.06 });
@@ -163,12 +201,14 @@ describe('simulation:start / simulation:stop', () => {
   it('keeps ticking for a second watcher even after the client who started it disconnects', async () => {
     const starter = await connectClient();
     const watcher = await connectClient();
+    const joinedStarter = nextEvent(starter, 'warehouse:joined');
+    const joinedWatcher = nextEvent(watcher, 'warehouse:joined');
     starter.emit('warehouse:join', WAREHOUSE_B);
     watcher.emit('warehouse:join', WAREHOUSE_B);
-    await wait(30);
+    await Promise.all([joinedStarter, joinedWatcher]);
 
     starter.emit('simulation:start', { warehouseId: WAREHOUSE_B, deltaSeconds: 0.06 });
-    await wait(80);
+    await wait(120);
     const callsBeforeDisconnect = runTick.mock.calls.length;
     expect(callsBeforeDisconnect).toBeGreaterThanOrEqual(1);
 
@@ -183,11 +223,12 @@ describe('simulation:start / simulation:stop', () => {
 
   it('auto-stops the loop once every client leaves the warehouse room', async () => {
     const client = await connectClient();
+    const joined = nextEvent(client, 'warehouse:joined');
     client.emit('warehouse:join', WAREHOUSE_A);
-    await wait(30);
+    await joined;
 
     client.emit('simulation:start', { warehouseId: WAREHOUSE_A, deltaSeconds: 0.06 });
-    await wait(80);
+    await wait(120);
     expect(runTick.mock.calls.length).toBeGreaterThanOrEqual(1);
 
     // Once this client leaves, it's no longer in the room - it can't be
@@ -197,7 +238,7 @@ describe('simulation:start / simulation:stop', () => {
     // place). So verify the stop by observing that runTick stops
     // advancing, rather than expecting this socket to hear its own event.
     client.emit('warehouse:leave', WAREHOUSE_A);
-    await wait(30);
+    await wait(80);
     const callsAtLeave = runTick.mock.calls.length;
     await wait(150);
     expect(runTick.mock.calls.length).toBe(callsAtLeave);

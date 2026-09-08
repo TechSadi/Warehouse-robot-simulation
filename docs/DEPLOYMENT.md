@@ -56,13 +56,42 @@ them build and start it.
 |---|---|---|
 | `NODE_ENV` | `production` | Enables the production Morgan log format, hides stack traces from error responses, and trusts the platform's reverse proxy for `req.ip` (see [`ARCHITECTURE.md`](./ARCHITECTURE.md)) |
 | `MONGO_URI` | the Atlas connection string from step 1 | Include the database name |
-| `CLIENT_ORIGINS` | your deployed frontend's URL, e.g. `https://your-app.vercel.app` | Comma-separated if you have more than one (e.g. a preview deployment URL too) - this drives both REST CORS and the Socket.IO CORS check |
+| `CLIENT_ORIGINS` | your deployed frontend's URL, e.g. `https://your-app.vercel.app` | **Required in production** - the server refuses to boot without it rather than falling back to an open CORS policy. Comma-separated if you have more than one (e.g. a preview deployment URL too). Drives both REST CORS and the Socket.IO CORS check. Exact origin only: scheme + host, no trailing slash or path |
+| `JWT_ACCESS_SECRET` | 48 random bytes, base64url | **Required in production.** Generate with `node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"`. Must be at least 32 characters |
+| `JWT_REFRESH_SECRET` | a **different** 48 random bytes | **Required in production.** Two keys, not one, so a leaked access secret cannot also mint refresh tokens |
 | `PORT` | usually not needed | Render/Railway set this automatically; the app reads `process.env.PORT` and falls back to `5000` locally |
 | `SOCKET_PATH` | leave unset | Only needed if you're proxying Socket.IO through a non-default path |
 | `TICK_INTERVAL_MS` | leave unset | Only needed to change the 500ms tick cadence |
+| `BCRYPT_ROUNDS`, `JWT_*_TTL_SECONDS`, `MAX_FAILED_LOGINS`, `LOGIN_LOCKOUT_SECONDS`, `COOKIE_*` | leave unset | Sensible defaults; see [`SECURITY.md`](./SECURITY.md#9-environment-secrets) |
+
+Set the two JWT secrets **before** the first deploy of this version: the
+server throws on startup if either is missing or under 32 characters,
+rather than silently using a default that would be identical on every
+deployment. Rotating either one signs every user out - which is the
+intended emergency response to a suspected leak.
 
 Once deployed, note the backend's public URL (e.g.
 `https://your-backend.onrender.com`) - the frontend needs it next.
+
+### Migrating data created before the security phase
+
+`Warehouse.ownerId` is required, and warehouses created before this
+version have none - so they match no ownership query and are invisible
+through the API. Nothing is lost; the documents are untouched in Atlas.
+
+Register an account through the deployed app, then run the backfill
+against the production connection string (dry run first):
+
+```
+cd backend
+MONGO_URI="<atlas uri>" node scripts/backfill-ownership.js --email you@example.com
+MONGO_URI="<atlas uri>" node scripts/backfill-ownership.js --email you@example.com --apply
+```
+
+It only sets `ownerId` on warehouses that have none - it never reassigns
+an owned one, never touches robots/orders/statistics/logs (those inherit
+ownership through the warehouse), and never deletes anything. Take an
+Atlas snapshot before `--apply` regardless.
 
 ### Verify the backend
 
@@ -72,6 +101,14 @@ curl https://your-backend.onrender.com/api/health
 should return `{ "success": true, "data": { "status": "ok", "database": "connected", ... } }`.
 If `database` says anything other than `connected`, double check the
 Atlas connection string and network access list from step 1.
+
+`/api/health` is the only route that answers without a session. Every
+other endpoint now returns `401` unauthenticated, so this is also a quick
+way to confirm auth is live:
+
+```
+curl -i https://your-backend.onrender.com/api/warehouses     # expect 401
+```
 
 ## 3. Frontend (Vercel or Netlify)
 

@@ -1,6 +1,6 @@
 const mongoose = require('mongoose');
+const { STATUSES } = require('../domain/orderLifecycle');
 
-const STATUSES = ['pending', 'assigned', 'picked_up', 'delivered', 'cancelled'];
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'];
 
 const pointSchema = new mongoose.Schema(

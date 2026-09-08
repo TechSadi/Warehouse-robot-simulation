@@ -79,11 +79,15 @@ describe('dispatchPendingOrders', () => {
     // state, not one findByIdAndUpdate call per assignment.
     expect(Robot.bulkWrite).toHaveBeenCalledTimes(1);
     expect(Robot.bulkWrite.mock.calls[0][0]).toHaveLength(2);
+    // The filter carries the lifecycle guard as well as the id: the
+    // simulation goes through the same state machine the REST API does
+    // (domain/orderLifecycle.js), applied atomically so an order that
+    // stopped being dispatchable mid-pass is not overwritten.
     expect(Order.bulkWrite).toHaveBeenCalledWith(
       expect.arrayContaining([
         expect.objectContaining({
           updateOne: expect.objectContaining({
-            filter: { _id: 'o1' },
+            filter: { _id: 'o1', status: { $in: ['pending'] } },
             update: expect.objectContaining({ status: 'assigned', assignedRobot: expect.any(String) }),
           }),
         }),
@@ -170,8 +174,20 @@ describe('processTickEvents', () => {
     // cheap to guard against) can never apply out of sequence.
     expect(Order.bulkWrite).toHaveBeenCalledWith(
       [
-        { updateOne: { filter: { _id: 'o1' }, update: expect.objectContaining({ status: 'picked_up' }) } },
-        { updateOne: { filter: { _id: 'o2' }, update: expect.objectContaining({ status: 'delivered' }) } },
+        {
+          updateOne: {
+            // Only from a state that legally precedes picked_up - a
+            // cancelled order is not resurrected by an in-flight tick.
+            filter: { _id: 'o1', status: { $in: ['assigned', 'picking_up'] } },
+            update: expect.objectContaining({ status: 'picked_up' }),
+          },
+        },
+        {
+          updateOne: {
+            filter: { _id: 'o2', status: { $in: ['picked_up', 'delivering'] } },
+            update: expect.objectContaining({ status: 'delivered' }),
+          },
+        },
       ],
       { ordered: true }
     );

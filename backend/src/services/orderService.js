@@ -5,6 +5,7 @@ const { generateRandomOrders } = require('../engine/orders/orderGenerator');
 const { planAssignments } = require('../engine/scheduling/strategies');
 const { warehouseToGrid } = require('../engine/grid/warehouseGrid');
 const { LOW_BATTERY_THRESHOLD } = require('../engine/robots/robotEngine')
+const { predecessorsOf } = require('../domain/orderLifecycle');
 const simulationManager = require('./simulationManager');
 const { ApiError } = require('../middleware/errorHandler');
 const simulationEvents = require('../events/simulationEvents');
@@ -97,7 +98,12 @@ async function dispatchPendingOrders(warehouseId) {
     updatedSnapshots.push(snapshot);
     orderUpdates.push({
       updateOne: {
-        filter: { _id: orderId },
+        // The status term makes this the same transition check the REST
+        // API performs, applied atomically: if the order stopped being
+        // dispatchable between the read above and this write (cancelled
+        // from the UI, or assigned by a concurrent dispatch), the filter
+        // matches nothing instead of overwriting a later state.
+        filter: { _id: orderId, status: { $in: predecessorsOf('assigned') } },
         update: { status: 'assigned', assignedRobot: robotId, assignedAt: new Date() },
       },
     });
@@ -137,11 +143,21 @@ async function processTickEvents(warehouseId, events) {
   for (const event of events) {
     if (event.type === 'picked_up') {
       orderUpdates.push({
-        updateOne: { filter: { _id: event.orderId }, update: { status: 'picked_up', pickedUpAt: new Date() } },
+        updateOne: {
+          // Same lifecycle gate as the REST API (domain/orderLifecycle.js),
+          // expressed as a filter so it holds atomically: an order the
+          // client cancelled mid-leg is not silently resurrected into
+          // `picked_up` by a tick that was already in flight.
+          filter: { _id: event.orderId, status: { $in: predecessorsOf('picked_up') } },
+          update: { status: 'picked_up', pickedUpAt: new Date() },
+        },
       });
     } else if (event.type === 'delivered') {
       orderUpdates.push({
-        updateOne: { filter: { _id: event.orderId }, update: { status: 'delivered', deliveredAt: new Date() } },
+        updateOne: {
+          filter: { _id: event.orderId, status: { $in: predecessorsOf('delivered') } },
+          update: { status: 'delivered', deliveredAt: new Date() },
+        },
       });
       const counts = schedulerState.completedCounts;
       counts.set(event.robotId, (counts.get(event.robotId) || 0) + 1);

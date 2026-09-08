@@ -1,4 +1,5 @@
 const request = require('supertest');
+const { authed, mockOwnership, makeWarehouse, USER_A_ID } = require('../helpers/auth');
 
 const WAREHOUSE_ID = '507f1f77bcf86cd799439022';
 
@@ -15,11 +16,25 @@ jest.mock('../../src/services/simulationManager', () => ({
   invalidate: jest.fn(),
 }));
 
+// Ownership is resolved through the warehouse on every route below - see
+// middleware/authorize.js.
+jest.mock('../../src/models/Warehouse', () => ({
+  find: jest.fn(),
+  findById: jest.fn(),
+  findOne: jest.fn(),
+  countDocuments: jest.fn(),
+  CELL_TYPES: ['shelf', 'charging', 'obstacle', 'dock'],
+}));
+
 const orderService = require('../../src/services/orderService');
+const Warehouse = require('../../src/models/Warehouse');
 const app = require('../../src/app');
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockOwnership(Warehouse, {
+    warehouse: makeWarehouse(WAREHOUSE_ID, USER_A_ID, { rows: 20, cols: 20 }),
+  });
 });
 
 describe('POST /api/warehouses/:id/orders/generate', () => {
@@ -30,9 +45,9 @@ describe('POST /api/warehouses/:id/orders/generate', () => {
     ];
     orderService.generateOrders.mockResolvedValue(orders);
 
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/warehouses/${WAREHOUSE_ID}/orders/generate`)
-      .send({ count: 2 });
+      .send({ count: 2 }));
 
     expect(res.status).toBe(201);
     expect(res.body.data).toEqual(orders);
@@ -41,14 +56,14 @@ describe('POST /api/warehouses/:id/orders/generate', () => {
 
   it('defaults count to 5 when not provided', async () => {
     orderService.generateOrders.mockResolvedValue([]);
-    await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/generate`).send({});
+    await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/generate`).send({}));
     expect(orderService.generateOrders).toHaveBeenCalledWith(WAREHOUSE_ID, 5);
   });
 
   it('rejects a count outside the allowed range', async () => {
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/warehouses/${WAREHOUSE_ID}/orders/generate`)
-      .send({ count: 500 });
+      .send({ count: 500 }));
     expect(res.status).toBe(400);
   });
 
@@ -56,7 +71,7 @@ describe('POST /api/warehouses/:id/orders/generate', () => {
     const { ApiError } = require('../../src/middleware/errorHandler');
     orderService.generateOrders.mockRejectedValue(new ApiError(422, 'Cannot generate orders: warehouse needs at least 2 walkable cells'));
 
-    const res = await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/generate`).send({});
+    const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/generate`).send({}));
     expect(res.status).toBe(422);
   });
 });
@@ -66,7 +81,7 @@ describe('POST /api/warehouses/:id/orders/dispatch', () => {
     const assignments = [{ orderId: 'o1', robotId: 'r1' }];
     orderService.dispatchPendingOrders.mockResolvedValue(assignments);
 
-    const res = await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/dispatch`);
+    const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/dispatch`));
 
     expect(res.status).toBe(200);
     expect(res.body.data.assignments).toEqual(assignments);
@@ -76,7 +91,7 @@ describe('POST /api/warehouses/:id/orders/dispatch', () => {
 
   it('returns an empty assignment list when nothing can be dispatched', async () => {
     orderService.dispatchPendingOrders.mockResolvedValue([]);
-    const res = await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/dispatch`);
+    const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/orders/dispatch`));
     expect(res.status).toBe(200);
     expect(res.body.data.count).toBe(0);
   });

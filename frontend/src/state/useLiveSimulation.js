@@ -157,6 +157,16 @@ export function useLiveSimulation(warehouseId, grid) {
       refreshSnapshot(warehouseId);
     }
 
+    // The server now refuses socket events it will not serve - a warehouse
+    // the caller does not own, a malformed payload, or too many events too
+    // fast. These arrive as events rather than as a failed promise (an
+    // emit has nothing to reject), so without a listener the UI would sit
+    // there looking like nothing had happened at all.
+    function onSocketError(payload) {
+      setActionError(payload?.message || 'The server refused that request.');
+      if (payload?.event === 'simulation:start') setIsRunning(false);
+    }
+
     socket.on('robots:changed', onRobotsChanged);
     socket.on('robots:removed', onRobotsRemoved);
     socket.on('orders:changed', onOrdersChanged);
@@ -164,6 +174,10 @@ export function useLiveSimulation(warehouseId, grid) {
     socket.on('notification', onNotification);
     socket.on('simulation:status', onSimulationStatus);
     socket.on('connect', onReconnect);
+    socket.on('error:unauthorized', onSocketError);
+    socket.on('error:validation', onSocketError);
+    socket.on('error:rate_limit', onSocketError);
+    socket.on('error:server', onSocketError);
 
     return () => {
       socket.off('robots:changed', onRobotsChanged);
@@ -173,6 +187,10 @@ export function useLiveSimulation(warehouseId, grid) {
       socket.off('notification', onNotification);
       socket.off('simulation:status', onSimulationStatus);
       socket.off('connect', onReconnect);
+      socket.off('error:unauthorized', onSocketError);
+      socket.off('error:validation', onSocketError);
+      socket.off('error:rate_limit', onSocketError);
+      socket.off('error:server', onSocketError);
       socket.emit('warehouse:leave', warehouseId);
     };
   }, [warehouseId, refreshSnapshot]);

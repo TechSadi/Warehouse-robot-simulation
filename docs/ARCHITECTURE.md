@@ -153,7 +153,10 @@ Documented here rather than silently left for someone to discover:
   arguably a feature (nothing you generated disappears by accident), but
   it does mean orphaned documents accumulate if you delete warehouses
   during testing.
-- **No authentication, no per-user data isolation.** See
+- **No cascading deletes across the ownership boundary either.** Deleting
+  a warehouse leaves its robots and orders in place; they become
+  unreachable through the API (ownership resolves through the warehouse,
+  which is gone) rather than being removed. See
   [Security notes](#security-notes) below.
 - **`Robot.taskQueue` in the schema isn't the live source of truth.** The
   Robot Engine keeps its own in-memory task queue of plain
@@ -162,31 +165,46 @@ Documented here rather than silently left for someone to discover:
   comment in `Robot.js`.
 - **Frontend has no automated test suite.** Every frontend milestone was
   verified by a clean production build - not by unit or integration
-  tests. The backend (265 tests) carries essentially all of this
-  project's automated test coverage.
+  tests. The backend (434 tests, 165 of them security tests) carries
+  essentially all of this project's automated test coverage. The auth
+  gate, the CSRF header the API client attaches, and the socket
+  reconnect-on-sign-in are therefore covered only on the server side.
 
 ## Security notes
 
-This is a demo/portfolio project, and its security posture reflects
-that - worth being explicit about before deploying it anywhere it might
-be reachable by strangers, or using it as a template for something that
-handles real data:
+Superseded by [`SECURITY.md`](./SECURITY.md), which is the authoritative
+document. Summarised here because the rest of this file refers to it.
 
-- **No authentication or authorization anywhere.** Every REST endpoint
-  and every Socket.IO room is open to anyone who can reach the server.
-  Knowing (or guessing) a warehouse's ObjectId is sufficient to read and
-  modify it.
-- **CORS is origin-restricted but credential-agnostic.** `CLIENT_ORIGINS`
-  (see [`DEPLOYMENT.md`](./DEPLOYMENT.md#backend-environment-variables)) locks
-  which origins can call the API and open a socket connection, which is
-  real protection against a *browser-based* random third-party site
-  calling your deployed API - but nothing stops a direct, non-browser
-  request (`curl`, a script) from any origin, since CORS is a
-  browser-enforced mechanism, not a server-side access control.
-- **No rate limiting.** A public deployment on a free-tier host is
-  reachable by anyone at whatever rate they choose to send requests.
-- Before using this as a foundation for anything real: add
-  authentication (even a simple API key would meaningfully raise the
-  bar), scope every query to an authenticated user/tenant rather than a
-  guessable warehouse id, and add rate limiting at the reverse-proxy or
-  application layer.
+The project was originally built with no authentication at all: every REST
+endpoint and every Socket.IO room was open to anyone who could reach the
+server, and knowing (or guessing) a warehouse's ObjectId was enough to
+read and modify it. The security phase replaced that with:
+
+- **Cookie-based authentication** - short-lived JWT access tokens plus
+  rotating, revocable refresh tokens, both in httpOnly cookies. bcrypt
+  password hashing, per-IP and per-account login throttling, uniform
+  responses so the login form is not an account-existence oracle.
+- **Resource-level authorization** - every robot, order, obstacle,
+  statistic and log reaches its owner through the warehouse it belongs to
+  (`Warehouse.ownerId`). One middleware module answers every ownership
+  question for both REST and Socket.IO; another user's resource returns
+  `404`, indistinguishable from one that never existed.
+- **Allow-list DTOs on every write path**, so `ownerId`, `role`,
+  simulation state, and server-recorded timestamps are not client-settable.
+- **Shared domain state machines** for the order and robot lifecycles, so
+  the generic CRUD endpoints cannot bypass rules the simulation engine
+  enforces.
+- **Socket.IO handshake authentication**, per-event authorization, payload
+  validation, and per-socket event rate limiting.
+- **Tiered HTTP rate limiting**, strict CORS with no wildcard-plus-
+  credentials, Helmet, and double-submit CSRF protection.
+
+CORS remains a browser-enforced mechanism rather than an access control -
+a direct `curl` request is not subject to it. That is no longer the
+problem it was, because `requireAuth` now gates every route regardless of
+where the request came from.
+
+What is still *not* covered - email verification, password reset, MFA,
+sharing between accounts, and security-event audit logging - is listed
+with the rest of the residual risk in
+[`SECURITY.md`](./SECURITY.md#10-threat-model).
