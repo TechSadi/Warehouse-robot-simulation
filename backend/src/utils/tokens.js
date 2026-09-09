@@ -84,6 +84,34 @@ function setAuthCookies(res, { accessToken, refreshToken, csrfToken }) {
   });
 }
 
+/**
+ * Returns the CSRF token for the current request, setting the cookie first
+ * if this browser somehow does not have one.
+ *
+ * This exists for the cross-origin deployment. The double-submit pair
+ * works by having the client read the CSRF cookie and echo it in a header,
+ * but a cookie set by the API's origin is host-only - a page served from
+ * the frontend's origin (Vercel, while the API is on Render) cannot see it
+ * through `document.cookie` at all. Handing the value back in the body of
+ * an authenticated, CORS-restricted GET is what lets that client hold up
+ * its half of the pair; only the allow-listed frontend origin can read the
+ * response, so this reveals nothing to a cross-site attacker that the
+ * cookie did not already.
+ */
+function ensureCsrfCookie(req, res) {
+  const existing = req.cookies?.[CSRF_COOKIE];
+  if (existing) return existing;
+
+  const csrfToken = generateCsrfToken();
+  res.cookie(CSRF_COOKIE, csrfToken, {
+    ...baseCookieOptions(),
+    httpOnly: false,
+    path: '/',
+    maxAge: env.auth.refreshTtlSeconds * 1000,
+  });
+  return csrfToken;
+}
+
 function clearAuthCookies(res) {
   const base = baseCookieOptions();
   // Attributes must match the ones the cookie was set with, or the browser
@@ -114,6 +142,7 @@ module.exports = {
   generateRefreshToken,
   generateCsrfToken,
   setAuthCookies,
+  ensureCsrfCookie,
   clearAuthCookies,
   safeEqual,
 };

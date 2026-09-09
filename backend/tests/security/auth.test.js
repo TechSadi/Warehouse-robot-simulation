@@ -432,6 +432,49 @@ describe('GET /api/auth/me', () => {
     expect(res.body.data.user.email).toBe('alice@example.com');
     expect(res.body.data.user.passwordHash).toBeUndefined();
   });
+
+  /**
+   * The deployed frontend is on a different origin than the API, so the
+   * CSRF cookie - host-only to the API - is invisible to `document.cookie`
+   * on the page. This endpoint is the only call a reloaded tab makes
+   * before it starts issuing writes, so it is where that client has to be
+   * able to recover the token. Without this it held a valid session it
+   * could not make a single state-changing request with.
+   */
+  it('returns the CSRF token so a cross-origin client can echo it back', async () => {
+    await register();
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'alice@example.com', password: GOOD_PASSWORD });
+
+    const res = await request(app).get('/api/auth/me').set('Cookie', login.headers['set-cookie']);
+
+    expect(res.status).toBe(200);
+    // The same value the cookie carries, or the double-submit pair would
+    // not match on the next write.
+    expect(res.body.data.csrfToken).toBe(login.body.data.csrfToken);
+  });
+
+  it('issues and sets a CSRF token when the request arrives without one', async () => {
+    await register();
+    const login = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'alice@example.com', password: GOOD_PASSWORD });
+
+    // Access cookie only: a browser that dropped the readable half, or a
+    // client that never stored it.
+    const accessCookie = login.headers['set-cookie']
+      .map((c) => c.split(';')[0])
+      .find((c) => c.startsWith('wrs_access='));
+
+    const res = await request(app).get('/api/auth/me').set('Cookie', accessCookie);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.csrfToken).toEqual(expect.any(String));
+    // Set on the response too, so the cookie and the body agree.
+    const setCsrf = (res.headers['set-cookie'] || []).find((c) => c.startsWith('wrs_csrf='));
+    expect(setCsrf).toContain(`wrs_csrf=${res.body.data.csrfToken}`);
+  });
 });
 
 describe('refresh rotation', () => {

@@ -2,7 +2,12 @@ const authService = require('../services/authService');
 const asyncHandler = require('../utils/asyncHandler');
 const { pick } = require('../middleware/dto');
 const { ApiError } = require('../middleware/errorHandler');
-const { REFRESH_COOKIE, setAuthCookies, clearAuthCookies } = require('../utils/tokens');
+const {
+  REFRESH_COOKIE,
+  setAuthCookies,
+  clearAuthCookies,
+  ensureCsrfCookie,
+} = require('../utils/tokens');
 const env = require('../config/env');
 
 /**
@@ -67,7 +72,15 @@ const logoutAll = asyncHandler(async (req, res) => {
 
 const me = asyncHandler(async (req, res) => {
   if (!req.user) throw new ApiError(401, 'Not authenticated');
-  res.json({ success: true, data: { user: req.user.toPublicJSON() } });
+  // The CSRF token rides along for the same reason respondWithSession
+  // echoes it: a client on a different origin than the API cannot read the
+  // cookie, and this is the call it makes on every page load. Without it a
+  // reloaded tab holds a valid session it cannot make a single
+  // state-changing request with. See utils/tokens.js#ensureCsrfCookie.
+  res.json({
+    success: true,
+    data: { user: req.user.toPublicJSON(), csrfToken: ensureCsrfCookie(req, res) },
+  });
 });
 
 /**
