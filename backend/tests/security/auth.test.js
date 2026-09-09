@@ -575,3 +575,90 @@ describe('POST /api/auth/logout', () => {
     expect(afterLogout.status).toBe(401);
   });
 });
+
+/**
+ * Auth cookies outlive the sessions they belong to - the access cookie for
+ * 15 minutes, the refresh cookie for 30 days - and a session can be
+ * revoked or rotated out from under them at any point. A browser sitting
+ * on a stale pair used to be refused by every endpoint that could have
+ * recovered it, because CSRF was gated on the cookie merely being present.
+ * That is a lockout with no way out from inside the application.
+ */
+describe('a browser holding stale auth cookies', () => {
+  const STALE = ['wrs_access=stale.access.token', 'wrs_refresh=staleRefreshTokenValue'];
+
+  it('can still register', async () => {
+    const res = await request(app)
+      .post('/api/auth/register')
+      .set('Cookie', STALE)
+      .send({ email: 'newcomer@example.com', password: GOOD_PASSWORD, name: 'Newcomer' });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('can still sign in, which replaces the stale cookies', async () => {
+    await register();
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .set('Cookie', STALE)
+      .send({ email: 'alice@example.com', password: GOOD_PASSWORD });
+
+    expect(res.status).toBe(200);
+    // The wedge clears itself: a fresh set of cookies lands on the way out.
+    expect(res.headers['set-cookie'].join(';')).toContain('wrs_access=');
+  });
+
+  it.each([
+    ['/api/auth/password/forgot', { email: 'alice@example.com' }],
+    ['/api/auth/password/reset', { token: 'x'.repeat(40), password: GOOD_PASSWORD }],
+    ['/api/auth/email/verify', { token: 'x'.repeat(40) }],
+  ])('can still reach %s', async (path, body) => {
+    const res = await request(app).post(path).set('Cookie', STALE).send(body);
+
+    // Whatever the endpoint decides about the credential itself, the
+    // request has to get past CSRF to decide anything at all.
+    expect(res.status).not.toBe(403);
+  });
+
+  /**
+   * The other half of the rule. These act on the authority of the cookie
+   * itself rather than on a credential in the body, so a third-party page
+   * being able to fire them is the whole thing CSRF exists to stop -
+   * /auth/refresh most of all, since it mints an entire new session.
+   */
+  it('is still refused a refresh without a matching CSRF header', async () => {
+    const res = await request(app).post('/api/auth/refresh').set('Cookie', STALE).send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.details.code).toBe('CSRF_FAILED');
+  });
+
+  it('is still refused a logout without a matching CSRF header', async () => {
+    const res = await request(app).post('/api/auth/logout').set('Cookie', STALE).send({});
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.details.code).toBe('CSRF_FAILED');
+  });
+
+  it('is still refused an ordinary authenticated write', async () => {
+    const res = await request(app)
+      .post('/api/warehouses')
+      .set('Cookie', STALE)
+      .send({ name: 'Forged', rows: 10, cols: 10 });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error.details.code).toBe('CSRF_FAILED');
+  });
+
+  it('does not exempt a path that merely starts like an exempt one', async () => {
+    // The exemption is an exact-match set, not a prefix test: this is an
+    // authenticated endpoint that happens to live under /email/verify.
+    const res = await request(app)
+      .post('/api/auth/email/verify/request')
+      .set('Cookie', STALE)
+      .send({});
+
+    expect(res.status).toBe(403);
+  });
+});
