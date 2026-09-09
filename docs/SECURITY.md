@@ -590,6 +590,41 @@ session — would be the request left unprotected.
 Callers presenting `Authorization: Bearer` instead of a cookie are exempt:
 there is no ambient credential for a third-party site to abuse.
 
+So are five endpoints whose authority is *not* the session cookie, listed
+as `CREDENTIAL_BEARING_PATHS` in `middleware/csrf.js`:
+
+| Exempt | Why |
+| --- | --- |
+| `POST /api/auth/register` | Establishes a session; the cookie in the jar has no bearing on it |
+| `POST /api/auth/login` | The password is the credential |
+| `POST /api/auth/password/forgot` | Unauthenticated by necessity |
+| `POST /api/auth/password/reset` | The emailed token is the credential |
+| `POST /api/auth/email/verify` | The emailed token is the credential |
+
+The exemption exists because gating these on cookie *presence* wedged the
+application shut. Auth cookies outlive the sessions they belong to — 15
+minutes for the access cookie, 30 days for the refresh cookie — and a
+session can be revoked or rotated out from under them at any time. A
+browser sitting on a stale pair was refused by every endpoint that could
+have recovered it: registering, signing in, and all three recovery flows
+answered 403 before they even validated the body, and the only remedy was
+to clear cookies by hand in developer tools. Cross-origin the page could
+not clear them either, since they belong to the API's origin. Signing in
+overwrites the stale cookies, so the state now clears itself.
+
+The exemption is an exact-match set, not a prefix test — `POST
+/api/auth/email/verify/request` is authenticated and stays protected —
+and it is matched against the full path rather than `req.path`, which is
+relative to wherever the middleware was mounted.
+
+The trade-off is login CSRF: an attacker can now cause a signed-in
+victim's browser to be logged into an account the attacker controls, so
+that the victim's subsequent work is recorded there. That was previously
+blocked for a victim who held cookies and allowed for one who did not,
+which is not a defence so much as an accident of the cookie check.
+Defending it properly needs a pre-session token issued to the sign-in form
+itself; that is not implemented, and is listed in §11.
+
 ---
 
 ## 8. Input validation
@@ -777,7 +812,17 @@ Six things that used to be on this list are not any more:
    is serving requests. The uptime and database state that used to be there
    moved to `/api/health/details` behind a session.
 
-9. **Warehouses created before the security phase have no owner** and are
+9. **Login CSRF is not defended.** The endpoints that carry their own
+   credential are exempt from the double-submit check (§7), so an attacker
+   can cause a victim's browser to be signed into an account the attacker
+   controls and collect whatever the victim then does in it. The previous
+   behaviour was not a defence either — it blocked this only for a victim
+   who happened to be holding auth cookies, while wedging every stale-cookie
+   browser out of the application entirely. Defending it properly needs a
+   pre-session token issued to the sign-in form itself, which is not
+   implemented.
+
+10. **Warehouses created before the security phase have no owner** and are
    invisible to the API until backfilled. See below.
 
 ---
@@ -871,6 +916,6 @@ them.
 ### Verification
 
 ```bash
-cd backend  && npm test          # 644 tests, incl. 246 security tests
-cd frontend && npm run verify    # lint, typecheck, 395 tests, production build
+cd backend  && npm test          # 655 tests, incl. 257 security tests
+cd frontend && npm run verify    # lint, typecheck, 401 tests, production build
 ```
