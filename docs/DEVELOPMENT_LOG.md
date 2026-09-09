@@ -791,6 +791,134 @@ any deeper testing, the same limitation every prior milestone's frontend
 work has had (no frontend test runner in this project, see Milestone 10's
 README note).
 
+## The limitations pass
+
+The four architecture documents each ended with a "known limitations"
+list - twenty-odd entries between them, written honestly as the project
+went along. This phase worked through those lists rather than adding a
+feature, which makes it a different kind of entry from the milestones
+above: the interesting part is not what was built but which entries turned
+out to be constraints, which turned out to be decisions, and which were
+simply stale.
+
+### Stale, not limitations
+
+Three entries described the code as it had been, not as it was. `POST
+/robots` did already register a robot with a cached engine; deleting a
+warehouse did already cascade. Both had been fixed in the reliability
+phase and neither list was updated.
+
+That is worth recording because it is the failure mode of a limitations
+list: it is written when something is *not* done, and nothing prompts
+anyone to revisit it when it is. The lists now carry an explicit "closed
+since this was written" section rather than quietly shrinking, so a reader
+can tell the difference between an entry that was removed because it was
+fixed and one that was removed because somebody forgot why it was there.
+
+### Constraints that were really decisions
+
+Two frontend entries - offline being read-only rather than queued, and
+watching one warehouse at a time - were listed as limitations and are not.
+Queueing commands issued while disconnected means replaying them against a
+simulation that has moved on, which is worse than declining them at the
+time; watching two warehouses at once is a different product, not a bigger
+version of this one. Both are now in a "decisions" section with the
+reasoning, because "we chose this" and "we ran out of time" deserve
+different words.
+
+### The ones that were real
+
+The rest were genuine, and the interesting pattern is how many turned out
+to share a root cause.
+
+**Three entries were one bug.** "In-flight movement is not resumed",
+"`Robot.taskQueue` is not the live source of truth" and half of "recovery
+releases in-flight orders" were the same fact seen from three angles: the
+engine's task queue was never persisted, so a restart threw the fleet's
+work away and every in-flight order had to be released and re-dispatched.
+Persisting `currentTask` and `taskQueue` closed all three. What is
+deliberately *not* persisted is the computed A\* path - a destination stays
+true across an outage, a path is a plan against a world that may have
+changed - so a robot comes back knowing where it was going and works out
+afresh how to get there.
+
+**"`clearError` is manual" was a symptom.** The stated limitation was that
+a robot whose battery reached zero away from a charger stays broken until
+a person clears it. The fix that suggests itself is auto-clearing the
+error, which does nothing: an idle robot at 0% still cannot move. The
+actual problem was upstream - nothing stopped a robot setting off on a
+route its charge could not cover. `_maybeAutoCharge` only ever looked at
+*idle* robots, so the obvious failure was unguarded. Now a moving robot
+re-evaluates its reserve against the route ahead and breaks off to charge,
+and `_recoverStranded` handles only what prevention cannot: a robot that
+was already flat. Deliberately *after* a visible delay, and reported as
+loudly as the fault, because a fleet that quietly repairs itself is a fleet
+whose operator never finds out their charging stations are in the wrong
+place.
+
+**"Single process" did not need a distributed lock.** The instinct is to
+make `warehouseLock` distributed. But the lock is correct at its own scope
+- it serialises operations within a process, over state that only that
+process has. What was missing was a layer above it deciding *which*
+process may advance a warehouse at all. A Mongo-backed lease with a unique
+index on `warehouseId` does that in about a hundred lines: two instances
+racing to claim one warehouse are two upserts on one unique key, exactly
+one wins, and the loser declines to tick. It does not make the simulation
+distributed, and the docs say so - if the holder dies, the warehouse is
+unattended for up to one lease TTL. A bounded gap is the right trade
+against two writers.
+
+**"No CSP on the frontend" was half true.** It was recorded as a
+hosting-configuration change outside the codebase, which is true of the
+*header* and not of the *policy*: `connect-src` has to name whichever API
+origin a given build was pointed at, and only the build knows that. So the
+policy is generated from `VITE_API_URL` and emitted three ways - a meta
+tag that works on any static host with no configuration, plus `_headers`
+and `vercel.json` for the header-only directives.
+
+**"No email infrastructure" justified deferring delivery, not the flows.**
+Password reset and email verification were out of scope on the grounds
+that there is no mail server. Delivery is genuinely somebody else's
+software, and it is now a transport seam (console, webhook, none). The
+token handling is not somebody else's software, and it is where the
+security actually lives: single use via an atomic consume, short-lived,
+superseded on reissue, bound to the address it was issued for. A password
+reset is an authentication bypass by design - whoever holds a valid token
+becomes the user - so it was worth building properly rather than not at
+all.
+
+**Account lockout was a real trade-off, and it was the wrong one.** The
+list already said so: a single account-wide counter lets anyone who knows
+a victim's email keep them locked out. The fix is not "no lockout" but
+"lockout scoped to the source", which keeps the defence pointed at the
+attack. The cost is explicit and stated - an attacker with many addresses
+gets more attempts - and what bounds that is the per-IP limiter, which is
+the control actually suited to a distributed attack.
+
+**The canvas could not be tested, and still cannot.** jsdom has no 2D
+context and Playwright can only assert the element exists. What *could* be
+separated out was the layer of decisions above the pixels: the drawing
+moved into `renderScene.js` as pure functions of a scene object, and a
+recording stand-in for the context now checks viewport culling, layer
+order, robot status colours, the battery ring's sweep, heatmap
+normalisation, and that every colour drawn comes from the theme. That took
+`GridCanvas.jsx`'s old 45% up to 100% on the extracted module and 88%
+overall - and it did not make the original claim false. Whether those calls
+produce the right *image* is screenshot diffing, and the limitation list
+now says exactly that instead of the vaguer thing it used to say.
+
+**On testing**: backend 519 → 644, frontend 317 → 395, frontend coverage
+81% → 88%. The new backend suites are `tests/robots/batteryManagement`
+(the charge reserve and maintenance retrieval), `tests/reliability/
+persistence` (what survives a restart, and what the cache is allowed to
+hold), and four security suites covering account recovery, sharing,
+the admin surface and the TOTP implementation against the published RFC
+6238 vectors. Several existing tests changed rather than being added to,
+which is the honest signal that behaviour changed: the persist tests now
+assert the task queue is written, the tick-loop tests assert a measured
+delta rather than a nominal one, and the ownership helper understands two
+filter shapes because two guards ask different questions of it.
+
 ## Milestone roadmap
 
 1. **Project Setup** ✅
@@ -808,3 +936,6 @@ README note).
 13. **Advanced Features** ✅
 14. **Optimisation** ✅
 15. **Testing & Deployment** ✅ - see [`README.md`](../README.md) and [`docs/`](.)
+
+Since the roadmap finished: a security phase, a simulation reliability
+phase, a frontend reliability phase, and the limitations pass above.

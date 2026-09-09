@@ -35,18 +35,32 @@ at 100, defaults to 20) and return the `meta` block shown above.
 not `404`.
 
 **Auth.** Required. Every endpoint except `GET /health` and `/auth/*`
-needs a session; without one they return `401`. Sign in via
+needs a session; without one they return `401`. An account with
+multi-factor authentication enabled answers `POST /auth/login` with `401`
+and `error.details.code = "MFA_REQUIRED"` until the request also carries
+`mfaCode` or `recoveryCode` - a client that treats every 401 as "wrong
+password" will confuse those users. Sign in via
 `POST /auth/login`, which sets httpOnly cookies the browser then sends
 automatically - browser clients need `credentials: 'include'` on every
 request and must echo the readable `wrs_csrf` cookie in an `X-CSRF-Token`
 header on any non-GET. Non-browser clients may send
 `Authorization: Bearer <access token>` instead, which is exempt from CSRF.
 
-**Authorization.** Resources are owned: every robot, order, obstacle,
-statistic and log belongs to a warehouse, and every warehouse belongs to
-one user. Requesting another user's resource returns `404`, identical to
-one that never existed - deliberately, so ids cannot be enumerated. List
-endpoints are scoped to the caller.
+**Authorization.** Every robot, order, obstacle, statistic and log belongs
+to a warehouse, and every warehouse has one owner and any number of
+collaborators. Each route names the access level it needs - `view`, `edit`
+or `own`:
+
+- A warehouse the caller cannot reach **at all** returns `404`, identical
+  to one that never existed - deliberately, so ids cannot be enumerated.
+- A warehouse the caller can reach but **not far enough** returns `403`,
+  with `error.details` naming the level `required` and the level `granted`.
+  There is nothing left to conceal at that point, and "you may look but not
+  touch" is useful to be told.
+
+List endpoints are scoped to what the caller can reach, and warehouse
+listings carry an `access` field per entry so a client can render a shared
+warehouse read-only without discovering that by collecting a 403.
 
 **Busy warehouses.** Operations that mutate one warehouse's live
 simulation - ticking, dispatching, changing obstacles, creating or
@@ -70,6 +84,14 @@ Full details in [`SECURITY.md`](./SECURITY.md).
 | POST | `/auth/logout` | Revoke this session |
 | POST | `/auth/logout-all` | Revoke every session for the user |
 | GET | `/auth/me` | The current user |
+| POST | `/auth/password/forgot` | Start a password reset. `{ email }` |
+| POST | `/auth/password/reset` | Complete one. `{ token, password }` |
+| POST | `/auth/password/change` | Change it while signed in. `{ currentPassword, newPassword }` |
+| POST | `/auth/email/verify/request` | Send a confirmation link to the caller's own address |
+| POST | `/auth/email/verify` | Confirm. `{ token }` |
+| POST | `/auth/mfa/setup` | Generate a TOTP secret and an `otpauth://` URI |
+| POST | `/auth/mfa/enable` | Confirm enrolment. `{ code }` → recovery codes |
+| POST | `/auth/mfa/disable` | Turn it off. `{ password, code \| recoveryCode }` |
 
 Registration requires a password of at least 12 characters containing
 upper case, lower case, and a digit. `role` and every other privileged
@@ -88,8 +110,72 @@ field are ignored if sent.
 ```
 
 Login answers `401 "Invalid email or password"` whether or not the account
-exists. Repeated failures are rate-limited per IP and lock the account for
-15 minutes.
+exists. Repeated failures are rate-limited per IP and lock the *source
+network* out of the account for 15 minutes - per source rather than per
+account, so knowing someone's email is not enough to keep them out of their
+own account.
+
+`/auth/password/forgot` answers `202` with the same body whether or not the
+address has an account, and whether or not mail was actually delivered:
+anything else would make it a cleaner account-existence oracle than the
+login form. The reset link is single use, expires in 30 minutes, stops
+working if the account's address changes, and completing one revokes every
+existing session.
+
+**Multi-factor.** Enrolment is two steps - `/mfa/setup` returns a secret to
+scan, `/mfa/enable` proves you can read codes from it - so a user who loses
+their phone between the two is not locked out by the act of setting it up.
+Once enabled, `/auth/login` with only a password answers:
+
+```json
+// POST /auth/login -> 401
+{
+  "success": false,
+  "error": { "message": "A verification code from your authenticator app is required",
+             "details": { "code": "MFA_REQUIRED" } }
+}
+```
+
+Retry with `mfaCode` (six digits) or `recoveryCode`. A code whose time step
+has already been accepted is refused with `MFA_REPLAY`, so one captured and
+relayed by a phishing page does not work twice. Recovery codes are single
+use and shown exactly once, at `/mfa/enable`.
+
+---
+
+## Administration
+
+Requires the `admin` role. Deliberately narrow: an admin can see *about*
+users and can end their sessions, and has no route to act *as* them - no
+impersonation, no password setting, and no way to read another user's
+warehouses. Authorization in this API is access-based, and an admin bypass
+would make every access check conditional on a role.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/admin/users` | List accounts, filterable by `email`/`role` |
+| GET | `/admin/users/:id` | One account: verification, MFA, session count, active lockouts |
+| POST | `/admin/users/:id/revoke-sessions` | End every session and clear lockouts |
+| GET | `/admin/security-events` | The audit trail, filterable by `type`/`outcome`/`email`/`userId` |
+| GET | `/admin/status` | This instance: uptime, cached engines, warehouses being simulated |
+
+Every one of these is itself written to the audit trail, including the
+reads - an administrator looking through the security log is a security
+event.
+
+---
+
+## Telemetry
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/telemetry/client-errors` | Where the dashboard reports its own render failures |
+
+Authenticated, rate-limited, and everything in it treated as hostile text:
+`level` and `source` are server-assigned, so a client cannot author a log
+line that appears to have come from the simulation engine. A report may
+name a `warehouseId` so it lands in that warehouse's Logs panel; naming one
+the caller cannot reach drops the association rather than the report.
 
 ---
 
@@ -98,8 +184,29 @@ exists. Repeated failures are rate-limited per IP and lock the account for
 ### `GET /health`
 
 Always returns `200` if the process is up, regardless of database state -
-suitable for a PaaS health check. Reports the Mongo connection state
-rather than requiring it.
+suitable for a PaaS health check, which is all this endpoint is for.
+
+It is the only unauthenticated route outside `/auth`, so it reports only
+that the process is serving requests. It used to also return uptime and the
+database connection state, which is a small but real disclosure to anyone
+who asks: uptime dates a deployment, and a database state flipping to
+`disconnected` says exactly when the service is least able to defend
+itself. Neither is something a health check needs.
+
+```json
+{
+  "success": true,
+  "data": {
+    "service": "warehouse-robot-simulation-backend",
+    "status": "ok"
+  }
+}
+```
+
+### `GET /health/details`
+
+The operator's view - authenticated. Everything the public probe used to
+report.
 
 ```json
 {
@@ -138,6 +245,25 @@ how this relates to robots, orders, statistics, and logs.
 | DELETE | `/warehouses/:id/obstacles/:obstacleId` | Remove a dynamic obstacle |
 | POST | `/warehouses/:id/orders/generate` | Generate random pending orders |
 | POST | `/warehouses/:id/orders/dispatch` | Assign pending orders to idle robots |
+| GET | `/warehouses/:id/collaborators` | Who else can reach it (owner only) |
+| POST | `/warehouses/:id/collaborators` | Share it. `{ email, role: viewer \| editor }` (owner only) |
+| DELETE | `/warehouses/:id/collaborators/:userId` | Stop sharing (owner only) |
+
+The access level each of these needs is not the one the HTTP verb suggests,
+and is stated deliberately:
+
+| Level | Routes |
+|---|---|
+| `view` | `GET /:id`, `GET /:id/obstacles`, `POST /:id/path` |
+| `edit` | `POST /:id/tick`, the obstacle writes, order generation and dispatch |
+| `own` | `PUT /:id` (it can reshape the layout, which reloads the engine and requeues in-flight orders), `DELETE /:id`, `PATCH /:id/activate`, and all three collaborator routes |
+
+Collaborators are addressed by **email**, not by user id: an id is not
+something one person knows about another, and an endpoint that resolved one
+would be an enumeration oracle over the user table. Inviting an address
+with no account answers exactly as if it had one, for the same reason.
+There is no `owner` role to grant - so no amount of sharing can produce a
+warehouse with two people who can each remove the other.
 
 ### `POST /warehouses`
 
@@ -220,6 +346,17 @@ Returns `503` if the warehouse's operation queue is already full.
 `construction_zone`. Omit `durationSeconds` for one that doesn't expire
 on its own.
 
+Obstacles are runtime hazards rather than part of the saved *layout* -
+editing the floor plan does not touch them - but they are **persisted** on
+the warehouse document, so they survive a restart, a layout edit and an
+engine-cache eviction. `durationSeconds` counts down in *simulation* time,
+not wall-clock: a warehouse that was not running while the process was down
+comes back with the same time left on the clock it had when it stopped.
+
+`GET /warehouses/:id/obstacles` reads the live set when an engine happens to
+be loaded and the stored set otherwise. It never builds an engine, so a
+read cannot trigger the reconciliation pass an engine load performs.
+
 ---
 
 ## Robots
@@ -243,11 +380,12 @@ on its own.
 ```json
 { "name": "R1", "warehouseId": "<id>", "position": { "x": 0, "y": 0 }, "speed": 2, "battery": 100 }
 ```
-Note: creating a robot this way adds it to MongoDB, but if the
-warehouse's live in-memory engine was already built before this call, it
-won't retroactively pick up the new robot until the engine cache is next
-rebuilt - see the known limitation in
-[`ARCHITECTURE.md`](./ARCHITECTURE.md#known-limitations).
+The robot joins the warehouse's live engine immediately if one is loaded,
+registered inside the warehouse lock so it lands cleanly between two ticks
+rather than part-way through one. `position` must name a whole cell inside
+the warehouse: a fractional position is not a cell the engine can spawn on,
+and accepting one would create a robot that exists in MongoDB and can never
+join the simulation.
 
 ### `POST /robots/:id/tasks`
 
@@ -370,10 +508,10 @@ validated and rate-limited per socket. See
 
 | Event | Payload | Effect |
 |---|---|---|
-| `warehouse:join` | `warehouseId` (string) | Start receiving that warehouse's events |
+| `warehouse:join` | `warehouseId` (string) | Start receiving that warehouse's events. Requires `view` access, so a collaborator can watch a shared warehouse. |
 | `warehouse:leave` | `warehouseId` | Stop receiving them |
-| `simulation:start` | `{ warehouseId, deltaSeconds? }` | Start (or join) that warehouse's server-owned tick loop. Idempotent: starting an already-running warehouse changes nothing, and the reply says so. |
-| `simulation:stop` | `{ warehouseId }` | Stop it. Idempotent in the same way. |
+| `simulation:start` | `{ warehouseId, deltaSeconds?, background? }` | Start (or join) that warehouse's server-owned tick loop. Idempotent: starting an already-running warehouse changes nothing, and the reply says so. `background: true` keeps it running once the last client leaves the room, bounded by `MAX_BACKGROUND_SECONDS`; the default stops with the last watcher. Requires `edit` access - starting a simulation changes what everyone else in the room is watching. |
+| `simulation:stop` | `{ warehouseId }` | Stop it. Idempotent in the same way. Also requires `edit`. |
 | `simulation:sync` | `{ warehouseId }` | Ask for the server's current view of this warehouse. Sent automatically on every join; request it explicitly after a reconnect if you are not rejoining. |
 
 ### Server → client (errors)

@@ -84,6 +84,19 @@ rather than queued, so a slow tick cannot build a backlog that later
 replays as a burst - see
 [the concurrency model](./SIMULATION_ARCHITECTURE.md#3-concurrency-model).
 
+A dropped tick no longer loses the time it covered. The loop measures real
+elapsed time and advances by that, bounded by `MAX_TICK_DELTA_SECONDS`, so
+the simulation tracks the wall clock instead of drifting behind it every
+time the host is busy. Beyond that bound it is a *coarser* simulation
+rather than a slower one, and how much time was dropped is reported as
+`laggedSeconds`.
+
+Across processes, one instance owns a warehouse's tick loop at a time. The
+loop confirms its lease (`services/instanceLease.js`) before each tick, so
+a second backend instance running against the same database declines to
+advance a warehouse the first one is already advancing - rather than
+running a second simulation of it and writing over the first.
+
 ## Real-time layer
 
 ```mermaid
@@ -157,31 +170,52 @@ combination can be shown or hidden independently.
 
 ## Known limitations
 
-Documented here rather than silently left for someone to discover:
+Documented here rather than silently left for someone to discover. Three
+entries that used to live here have been closed and are recorded below
+with what replaced them, because "we fixed it" is more useful to a reader
+than a list that quietly shrinks.
 
-- **A robot spawned via `POST /robots` doesn't retroactively join an
-  already-cached live engine.** `simulationManager.getEngine` only seeds
-  a warehouse's in-memory robot list from MongoDB on a cache miss (first
-  access after a server restart, or after the warehouse's layout
-  changes). A robot created after that point exists in the database and
-  shows up in every connected client's roster (the `robots:changed`
-  event still fires), but won't actually move until the engine cache is
-  next rebuilt. Flagged in Milestone 11, not fixed since the fix would
-  require touching `robot.controller.js`'s `create` handler in a way
-  that risked hanging the existing test suite (see that milestone's entry
-  in the development log for the full reasoning).
-- **`Robot.taskQueue` in the schema isn't the live source of truth.** The
-  Robot Engine keeps its own in-memory task queue of plain
-  `{x, y}` destinations during simulation; the schema field is reserved,
-  not currently written by the running simulation. See the field's own
-  comment in `Robot.js`.
-- **Canvas rendering is not covered by any automated test.** The frontend
-  now has 317 Vitest tests and 17 Playwright end-to-end specs (see
-  [`FRONTEND_ARCHITECTURE.md`](./FRONTEND_ARCHITECTURE.md#6-testing)), but
-  jsdom has no 2D context and Playwright can only assert that the canvas
-  element exists - not what was drawn on it. `GridCanvas.jsx` therefore
-  sits at ~45% coverage and rendering regressions are still caught by
-  looking, not by CI.
+- **Rendering is verified above the pixels, not at them.** The drawing
+  logic moved out of `GridCanvas.jsx` into
+  [`renderScene.js`](../frontend/src/components/simulation/renderScene.js)
+  as pure functions of a scene object, and a recording stand-in for the
+  2D context now checks the decisions: what is culled, what order the
+  layers go down in, what colour a robot is for its status, how far round
+  its battery ring goes, that every colour used comes from the theme. What
+  is still not checked is the last mile - whether those calls produce the
+  right image - which is a screenshot-diffing problem and genuinely out of
+  reach in jsdom.
+- **A tick is bounded, so a badly lagging server loses time.** The
+  automatic loop advances by measured elapsed time rather than by its
+  nominal cadence, capped at `MAX_TICK_DELTA_SECONDS`. Dropped ticks no
+  longer lose the time they covered, but time beyond the cap is genuinely
+  gone - deliberately, because the alternative to a cap is a fleet that
+  teleports across the warehouse after a pause. What is lost is counted
+  (`laggedSeconds` in `simulation:status`) rather than hidden.
+- **Horizontal scaling needs the lease, and the lease is coarse.** One
+  process owns a warehouse's tick loop at a time
+  ([`instanceLease.js`](../backend/src/services/instanceLease.js)), which
+  is what stops two instances simulating one warehouse. It does not
+  *share* the simulation: if the holder dies, the warehouse is unattended
+  for up to one lease TTL before another instance can claim it. A bounded
+  gap is the right trade against two writers; a genuinely shared engine is
+  a different and much larger system.
+
+### Closed since this list was written
+
+- ~~A robot spawned via `POST /robots` doesn't retroactively join an
+  already-cached live engine.~~ `simulationManager.addRobotToCachedEngine`
+  registers it inside the warehouse lock, so it joins the fleet cleanly
+  between two ticks.
+- ~~`Robot.taskQueue` in the schema isn't the live source of truth.~~ It
+  and `currentTask` are written from the engine snapshot on every persist
+  and read back when an engine is built, so a restart resumes the route a
+  robot was driving instead of dropping it. The computed A\* path is still
+  not persisted, and deliberately: it describes a world that may have
+  changed, so the destination is replanned. See
+  [`SIMULATION_ARCHITECTURE.md`](./SIMULATION_ARCHITECTURE.md#10-known-limitations).
+- ~~Canvas rendering is not covered by any automated test.~~ See the first
+  entry above.
 
 ## Security notes
 
@@ -195,13 +229,18 @@ read and modify it. The security phase replaced that with:
 
 - **Cookie-based authentication** - short-lived JWT access tokens plus
   rotating, revocable refresh tokens, both in httpOnly cookies. bcrypt
-  password hashing, per-IP and per-account login throttling, uniform
-  responses so the login form is not an account-existence oracle.
+  password hashing, per-IP and per-source-network login throttling,
+  uniform responses so the login form is not an account-existence oracle.
+  Password reset, email verification and TOTP multi-factor authentication
+  all landed in the limitations pass.
 - **Resource-level authorization** - every robot, order, obstacle,
   statistic and log reaches its owner through the warehouse it belongs to
-  (`Warehouse.ownerId`). One middleware module answers every ownership
-  question for both REST and Socket.IO; another user's resource returns
-  `404`, indistinguishable from one that never existed.
+  (`Warehouse.ownerId`). One middleware module answers every access
+  question for both REST and Socket.IO; a warehouse the caller cannot
+  reach returns `404`, indistinguishable from one that never existed.
+  Warehouses can now be shared with `viewer`/`editor` collaborators, and
+  the level each route requires is named at the route rather than inferred
+  from the HTTP verb.
 - **Allow-list DTOs on every write path**, so `ownerId`, `role`,
   simulation state, and server-recorded timestamps are not client-settable.
 - **Shared domain state machines** for the order and robot lifecycles, so
@@ -217,7 +256,9 @@ a direct `curl` request is not subject to it. That is no longer the
 problem it was, because `requireAuth` now gates every route regardless of
 where the request came from.
 
-What is still *not* covered - email verification, password reset, MFA,
-sharing between accounts, and security-event audit logging - is listed
-with the rest of the residual risk in
+Email verification, password reset, MFA, sharing between accounts, an
+administrative surface and security-event audit logging were all listed
+here as out of scope, and all landed in the limitations pass. What remains
+- notably that this deployment has no infrastructure-level controls of its
+own - is listed with the rest of the residual risk in
 [`SECURITY.md`](./SECURITY.md#10-threat-model).

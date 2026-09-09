@@ -73,6 +73,7 @@ warehouse-robot-simulation/
 │   ├── src/
 │   │   ├── config/        # env loading, DB connection
 │   │   ├── controllers/   # request handlers (one file per resource)
+│   │   ├── domain/        # Order + robot lifecycles, shared by the engine and the REST layer
 │   │   ├── engine/
 │   │   │   ├── grid/         # Backend cell-type mirror + Warehouse->grid adapter
 │   │   │   ├── obstacles/    # Dynamic obstacle manager (human workers, construction zones, etc.)
@@ -82,21 +83,24 @@ warehouse-robot-simulation/
 │   │   │   └── scheduling/   # 5 selectable order->robot assignment strategies
 │   │   ├── events/         # simulationEvents - the bus decoupling the engine from Socket.IO
 │   │   ├── middleware/    # error handling, request validation
-│   │   ├── models/        # Mongoose schemas: Warehouse, Robot, Order, Statistics, Log
+│   │   ├── models/        # Mongoose schemas: Warehouse, Robot, Order, Statistics, Log,
+│   │   │                   #   User, RefreshToken, VerificationToken, SecurityEvent, SimulationLease
 │   │   ├── routes/        # Express routers (one file per resource)
-│   │   ├── services/      # simulationManager, orderService, tickRunner - bridge the pure engines to MongoDB
+│   │   ├── services/      # simulationManager, orderService, tickRunner - bridge the pure engines
+│   │   │                   #   to MongoDB; authService, mailer, securityAudit, instanceLease
 │   │   ├── sockets/       # Socket.IO setup: rooms, tickLoopManager (server-owned tick loop)
 │   │   ├── utils/         # asyncHandler, pagination
 │   │   ├── app.js         # Express app (middleware + routes)
 │   │   └── server.js      # HTTP server entry point
 │   ├── scripts/
 │   │   └── benchmark.js   # Fleet-scale tick-throughput benchmark, no MongoDB required
-│   ├── tests/             # Jest + Supertest - 519 tests
+│   ├── tests/             # Jest + Supertest - 644 tests
 │   ├── .env.example
 │   └── package.json
 ├── frontend/
 │   ├── src/
-│   │   ├── api/            # REST client, ApiError normalisation, realtime.js (socket lifecycle manager)
+│   │   ├── api/            # REST client, ApiError normalisation, realtime.js (socket lifecycle
+│   │   │                   #   manager), telemetry.js (client error reporting)
 │   │   ├── engine/
 │   │   │   ├── grid/       # Pure grid engine: create/resize/set/serialize
 │   │   │   └── grid/warehouseGenerator.js  # Procedural aisle/shelf/charging/dock layout generator
@@ -110,14 +114,15 @@ warehouse-robot-simulation/
 │   │   ├── components/
 │   │   │   ├── layout/     # AppShell, TopNav, ShortcutsHelp overlay
 │   │   │   ├── sidebar/    # Fleet roster (live robot list) / tool palette
-│   │   │   ├── simulation/ # SimulationCanvas frame + GridCanvas renderer (grid, robots, obstacles, A* search, heatmap)
+│   │   │   ├── simulation/ # SimulationCanvas frame + GridCanvas (viewport, input) + renderScene.js
+│   │   │   │               #   (the drawing itself, as pure functions - so it can be tested)
 │   │   │   ├── common/     # ErrorBoundary, shared loading/empty/error/banner feedback
 │   │   │   └── panels/     # Simulation + warehouse controls, obstacles, statistics, orders, notifications, AI visualisation, saved layouts, logs, chart
 │   │   ├── utils/          # format.js - status labels and number formatting shared by every panel
 │   │   ├── theme.js        # Color tokens mirrored from index.css (for canvas)
 │   │   ├── App.jsx
 │   │   └── main.jsx
-│   ├── tests/              # Vitest + Testing Library - 317 tests; tests/e2e is Playwright
+│   ├── tests/              # Vitest + Testing Library - 395 tests; tests/e2e is Playwright
 │   ├── index.html
 │   ├── vite.config.js      # Vite + Vitest config (single file)
 │   ├── playwright.config.js
@@ -175,15 +180,20 @@ see [`frontend/.env.example`](./frontend/.env.example) and
 [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) for the two build-time
 variables a production deployment needs instead.
 
-Run the frontend checks - lint, type inference over plain JS, 317 unit and
+Run the frontend checks - lint, type inference over plain JS, 395 unit and
 integration tests, and a production build - none of which need a database:
 
 ```bash
 cd frontend
 npm run verify             # all four, in order
-npm test                   # just the tests (~25s)
-npm run test:coverage      # currently 81% of statements
+npm test                   # just the tests (~35s)
+npm run test:coverage      # currently 88% of statements
 ```
+
+The production build also generates the frontend's Content-Security-Policy
+from `VITE_API_URL` and emits it as a meta tag plus `_headers` and
+`vercel.json` - see
+[`scripts/securityHeaders.js`](./frontend/scripts/securityHeaders.js).
 
 The end-to-end suite is separate because it is the one layer that needs a
 real stack - the backend, MongoDB, and a real browser - which is also what
@@ -234,23 +244,40 @@ post-deploy checklist.
 
 ## Known limitations
 
-This is a demo/portfolio project - see
-[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#known-limitations) for the
-full, honest list of what it does and does not do.
+This is a demo/portfolio project, and the limitation lists in the docs are
+maintained as a real record rather than as a disclaimer: each entry says
+what the constraint is, and the ones that have been closed say what
+replaced them. Start with
+[`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md#known-limitations), which
+links to the detailed lists in
+[`SIMULATION_ARCHITECTURE.md`](./docs/SIMULATION_ARCHITECTURE.md#10-known-limitations),
+[`SECURITY.md`](./docs/SECURITY.md#11-known-limitations) and
+[`FRONTEND_ARCHITECTURE.md`](./docs/FRONTEND_ARCHITECTURE.md#7-known-limitations).
 
-It is now a multi-user application: accounts, per-user data isolation,
+**It is a multi-user application.** Accounts, per-user data isolation,
 resource-level authorization, authenticated Socket.IO, rate limiting and
-CSRF protection all landed in the security phase.
-[`docs/SECURITY.md`](./docs/SECURITY.md) documents the whole posture
-including the threat model and what remains out of scope - notably no
-email verification, no password reset, no MFA, and no sharing between
-accounts.
+CSRF protection landed in the security phase; password reset, email
+verification, TOTP multi-factor authentication, warehouse sharing
+(`viewer`/`editor` collaborators), an administrative surface and a security
+audit trail landed after it.
+[`docs/SECURITY.md`](./docs/SECURITY.md) documents the whole posture,
+including the threat model and what is still deliberately out of scope -
+federated identity, per-device session management, and the infrastructure
+controls that belong to Render/Vercel/Atlas rather than to this code.
 
-The frontend is no longer the untested half: 317 Vitest unit and
-integration tests and 17 Playwright end-to-end specs now cover the state
-reducer, the connection lifecycle, every panel, and the full operator
-journey through a real browser. What they still cannot check is what gets
-drawn on the canvas - jsdom has no 2D context - so rendering regressions
-are caught by looking.
-[`docs/FRONTEND_ARCHITECTURE.md`](./docs/FRONTEND_ARCHITECTURE.md)
-covers the client's state ownership rules and the limits of each layer.
+**The simulation survives a restart.** Robots come back on the route they
+were driving, dynamic obstacles come back with them, and a tick advances by
+measured elapsed time rather than by an assumed cadence. One backend
+instance owns a warehouse's tick loop at a time, so a second instance
+running against the same database declines to simulate it rather than
+writing over the first.
+
+**The frontend is tested, including the canvas - up to a point.** 395
+Vitest unit and integration tests and 17 Playwright end-to-end specs cover
+the state reducer, the connection lifecycle, every panel, the drawing
+decisions behind the floor plan, and the full operator journey through a
+real browser. What no test here can check is whether those drawing calls
+produce the right *image*: that is screenshot diffing, and it is the honest
+residue of what used to be "rendering regressions are caught by looking".
+[`docs/FRONTEND_ARCHITECTURE.md`](./docs/FRONTEND_ARCHITECTURE.md) covers
+the client's state ownership rules and the limits of each testing layer.

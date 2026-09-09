@@ -53,11 +53,15 @@ moment the two can disagree, which is what §6 is about.
 Two consequences worth stating plainly, because they are choices and not
 accidents:
 
-- **Runtime-only state is genuinely lost when an engine is dropped.** A
-  robot's path, its queued destinations, the active obstacles, and the
-  coordinator's assignments do not survive a restart or a layout change.
-  Everything downstream of that is designed around it rather than pretending
-  otherwise.
+- **Some runtime state is genuinely lost when an engine is dropped, and
+  some is not.** A robot's *computed path* and the coordinator's in-memory
+  assignments do not survive a restart or a layout change; its
+  *destinations* and the warehouse's *dynamic obstacles* do, because both
+  are persisted. The split is deliberate rather than incidental: a
+  destination is a statement of intent that stays true across an outage,
+  while a path is a plan against a world that may have changed. So a robot
+  comes back knowing where it was going and works out afresh how to get
+  there.
 - **There is no optimistic-concurrency guard on the robot writes.** There
   does not need to be: while an engine is loaded it is the sole writer of
   physical state, and every write to it is serialized (§3). The REST API
@@ -146,10 +150,19 @@ Three details that matter:
   operation, so one bad tick cannot wedge a warehouse for the life of the
   process.
 
-This is deliberately a single-process, in-memory lock. It is correct for the
-deployment this application has - one Node process owning every live engine,
-exactly like the engine cache itself. A distributed lock would only mean
-something if the engine state were shared too, and it is not. See
+This is deliberately a single-process, in-memory lock, and it stays one. It
+serialises operations *within* one process, which is the right scope,
+because a lock is only meaningful over state it can actually protect and
+the engines are per-process.
+
+What used to be missing is the layer above it: nothing stopped a *second*
+process from loading the same warehouse and ticking it too, with its own
+engines and its own lock, so the two silently wrote over each other. That
+is now handled where it belongs - not by making this lock distributed, but
+by deciding which process may advance a given warehouse at all
+(`services/instanceLease.js`). One instance holds the lease, renews it as
+it ticks, and every other instance declines. Within the holder, this lock
+does exactly what it always did. See
 [Known limitations](#10-known-limitations).
 
 ### One engine per warehouse
@@ -299,6 +312,8 @@ runtime state and both need exactly the same fix.
 | Robot `charging`, still on a charging cell | Resumes charging. |
 | Robot `charging`, no longer on a charger | Loaded idle. |
 | Robot `error` | Stays broken. A restart is not a repair. |
+| Robot with a persisted `currentTask` / `taskQueue` | Destinations restored, `currentTask` first. An idle robot starts driving again; a charging or broken one keeps the queue and resumes through the normal paths. A destination the layout has since made unreachable is kept, not dropped - the robot lands in `error` with a reason, which is visible and retryable. |
+| Dynamic obstacles stored on the warehouse | Restored *before* the fleet, so a robot whose saved cell is now under a construction zone is judged against the world as it actually is. Anything already expired is dropped rather than resurrected. |
 | Robot on a cell that is no longer walkable, or contended by another robot | Left out of the engine, and marked `error` in Mongo with the reason. Previously it was dropped silently - absent from the simulation, but still listed through the API as a healthy idle robot. |
 | Order in any in-flight state | Released to `pending` with its assignment cleared. |
 
@@ -311,10 +326,12 @@ never be the reason a warehouse cannot be simulated at all. A failed *load*
 is not cached, so one bad database read does not break a warehouse for the
 life of the process.
 
-What this deliberately does **not** do: resume in-flight movement, replay
-missed ticks, or restore obstacles. The goal is that MongoDB is not left in a
-misleading state, not that the simulation continues as though nothing
-happened.
+What this deliberately does **not** do: resume in-flight *movement*, or
+replay missed ticks. A robot comes back at rest in the cell it was nearest
+and replans to the destination it was driving to - it does not resume from
+mid-corridor, because the corridor may not be there any more. The goal is
+that MongoDB is not left in a misleading state and that the fleet's *work*
+survives, not that the simulation continues as though nothing happened.
 
 ---
 
@@ -450,40 +467,67 @@ robot carrying?" query, which runs inside a delete request), and
 ## 10. Known limitations
 
 Stated rather than hidden - each of these is a live constraint, not a bug
-waiting to be filed.
+waiting to be filed. Most of what used to be on this list has been closed;
+see [what changed](#what-changed) below, because a list that quietly
+shrinks tells a reader less than one that says what replaced each entry.
 
-1. **Single process.** The engine cache, the tick loops and the warehouse
-   lock are all in-memory and per-process. Running two backend instances
-   against one database would give each its own engines, its own tick loops
-   and its own locks for the same warehouse - two simulations writing over
-   each other. Horizontal scaling needs warehouse-to-instance affinity (or a
-   shared engine), and neither exists today.
-2. **In-flight movement is not resumed** across a restart or a layout
-   change. Robots come back at rest and orders are requeued. This is a
-   deliberate simplification; the alternative is persisting paths and
-   replanning against a world that may have changed.
-3. **Dynamic obstacles are not persisted.** They vanish on restart. They are
-   a runtime hazard, not part of the saved layout.
-4. **Delivered orders keep a reference to a robot that may since have been
-   deleted.** That is history, and history is not rewritten - but it does
-   mean `assignedRobot` on a completed order can dangle.
-5. **Recovery runs on a cache miss**, which means a plain read (listing a
-   warehouse's obstacles, say) can trigger a reconciliation write. It is
-   idempotent and correct, but it is a side effect on a `GET`.
-6. **Automatic ticks are dropped, not deferred**, when the previous tick is
-   still running. A consistently slow warehouse therefore runs slower than
-   its configured cadence rather than falling behind and catching up. The
-   loop counts skipped ticks (`skippedTicks` in `simulation:status`) so this
-   is observable rather than silent.
-7. **The tick loop stops when the last watcher leaves.** A simulation is not
-   a background job here; nothing runs for an empty room.
-8. **`clearError` is manual.** A robot whose battery reached zero away from
-   a charger cannot move to one under its own power and stays in `error`
-   until a person clears it. Its order is released so the *order* is not
-   stuck, but the robot is.
-9. **No wall-clock guarantees.** `deltaSeconds` is whatever the caller
-   passes (bounded to 10s), not measured elapsed time, so a lagging server
-   produces a slower simulation rather than a jumpier one.
+1. **One process owns a warehouse; no process shares one.** A Mongo-backed
+   lease (`services/instanceLease.js`) gives exactly one instance the right
+   to tick a given warehouse, so two instances against one database no
+   longer run two simulations of it. What that does *not* do is share the
+   engine: if the holder dies, the warehouse is unattended until its lease
+   lapses (`SIMULATION_LEASE_TTL_SECONDS`, 30s by default) and another
+   instance claims it. A bounded gap is the right trade against two
+   writers. Reads are unaffected - a second instance can load an engine to
+   answer a query, it just may not advance time with it.
+2. **A restart resumes destinations, not motion.** A robot comes back at
+   the cell it was nearest, with `currentTask` and `taskQueue` intact, and
+   replans. The computed A\* path is deliberately not persisted: it
+   describes a world that may have changed while the process was down. So
+   a robot mid-corridor resumes its delivery, but not from mid-corridor.
+3. **Timed hazards count down in simulation time, not wall-clock time.**
+   A dynamic obstacle with 30 seconds left when the process stops comes
+   back with 30 seconds left. That is the coherent reading - the
+   simulation did not advance while it was down - but it does mean a
+   warehouse left stopped overnight wakes with all its hazards intact.
+4. **Recovery still writes on the load that triggers it.** Building an
+   engine reconciles the persisted fleet against what could actually be
+   loaded, which is a write. Read endpoints no longer force a load
+   (`peekEngine` / `readObstacles`), so a `GET` cannot cause one - but
+   joining a warehouse over Socket.IO can, because a sync needs the live
+   engine to report sub-tick positions.
+5. **Ticks are capped, so a badly lagging server loses time.** The loop
+   advances by measured elapsed time, bounded by `MAX_TICK_DELTA_SECONDS`.
+   Beyond that bound the excess is dropped, deliberately: the alternative
+   to a cap is a fleet that teleports after a pause. It is counted
+   (`laggedSeconds` in `simulation:status`) rather than hidden.
+6. **An unattended run has a ceiling.** `simulation:start` with
+   `background: true` keeps a warehouse ticking with nobody watching, but
+   only for `MAX_BACKGROUND_SECONDS` (one hour by default), after which
+   the loop stops itself. A forgotten browser tab must not be able to tick
+   a warehouse for the life of the process.
+7. **Maintenance retrieval is a teleport.** A robot whose battery reaches
+   zero away from a charger is moved to the nearest free station and
+   charged there after `STRANDED_RECOVERY_TICKS`. It is the one place the
+   engine relocates a robot without driving it - which is what a warehouse
+   would actually do with a dead unit, but it is not a simulated tow. If
+   the warehouse has no charging cell at all, the robot genuinely stays
+   stranded, because there is nowhere to take it.
+
+### What changed
+
+| Was | Now |
+|---|---|
+| In-flight movement is not resumed across a restart | `Robot.currentTask` and `Robot.taskQueue` are persisted from the engine snapshot and restored on load, so a robot resumes its route rather than being dropped and its order requeued (limitation 2 above is what is left of this) |
+| Dynamic obstacles are not persisted; they vanish on restart | Stored on the warehouse document and restored before the fleet, so a robot's saved cell is judged against the hazards that actually exist (limitation 3 is what is left) |
+| Delivered orders keep a reference to a robot that may since have been deleted | `Order.assignedRobotName` captures who carried it at assignment time, and deleting a robot clears the pointer on its finished orders - history kept, dangling reference gone |
+| Recovery runs on a cache miss, so a plain read can trigger a write | Read endpoints use `peekEngine`/`readObstacles` and never build an engine (limitation 4 is what is left) |
+| Automatic ticks are dropped, not deferred | Still dropped - queueing them would replay as a burst - but the time they covered is absorbed by the next tick that runs, within the cap (limitation 5) |
+| The tick loop stops when the last watcher leaves | Still the default, and now opt-out per run via `background: true` (limitation 6) |
+| `clearError` is manual; a flat robot stays broken until a person clears it | A robot breaks off a route its charge cannot cover and charges first; one that is flat anyway is retrieved by maintenance (limitation 7) |
+| No wall-clock guarantees; `deltaSeconds` is whatever the caller passes | The automatic loop measures real elapsed time (limitation 5) |
+| Running two instances gives each its own engines and locks | A Mongo-backed lease makes exactly one instance the writer (limitation 1) |
+| The engine cache is unbounded in warehouses ever touched | Bounded by idle TTL and LRU, with actively-ticking warehouses pinned |
 
 ---
 
