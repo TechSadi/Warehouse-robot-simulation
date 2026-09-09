@@ -225,4 +225,127 @@ describe('api client', () => {
       expect(global.fetch.mock.calls[0][0]).toContain('/obstacles/a%2Fb');
     });
   });
+
+  /**
+   * The deployed setup: the dashboard is served from one origin and the API
+   * from another. A cookie the API sets is host-only to the API's host, so
+   * `document.cookie` on the page is empty no matter how healthy the
+   * session is - while the browser still attaches those cookies to every
+   * request. That combination (cookie-authenticated, no CSRF header) is
+   * exactly what the server rejects, so before this every write in the
+   * deployed app failed with "Invalid or missing CSRF token".
+   */
+  describe('cross-origin sessions', () => {
+    let client;
+
+    async function freshClient() {
+      vi.resetModules();
+      return import('../../src/api/client.js');
+    }
+
+    beforeEach(async () => {
+      document.cookie = 'wrs_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+      window.localStorage.clear();
+      global.fetch = vi.fn();
+      client = await freshClient();
+    });
+
+    afterEach(() => {
+      window.localStorage.clear();
+    });
+
+    it('sends the CSRF header from the sign-in response when no cookie is readable', async () => {
+      global.fetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'from-body' } })
+      );
+      await client.login({ email: 'a@b.com', password: 'secret' });
+
+      global.fetch.mockResolvedValueOnce(jsonResponse({ success: true, data: {} }));
+      await client.dispatchOrders('w1');
+
+      const [, options] = global.fetch.mock.calls[1];
+      expect(options.headers['X-CSRF-Token']).toBe('from-body');
+    });
+
+    it('recovers the token from /auth/me, which is all a reloaded tab has', async () => {
+      global.fetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'from-me' } })
+      );
+      await client.getCurrentUser();
+
+      global.fetch.mockResolvedValueOnce(jsonResponse({ success: true, data: {} }));
+      await client.dispatchOrders('w1');
+
+      expect(global.fetch.mock.calls[1][1].headers['X-CSRF-Token']).toBe('from-me');
+    });
+
+    it('picks up the rotated token when a silent refresh renews the session', async () => {
+      global.fetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'first' } })
+      );
+      await client.login({ email: 'a@b.com', password: 'secret' });
+
+      // A write whose access token has lapsed: 401, silent refresh, retry.
+      // The refresh issues a new CSRF token; retrying with the old one
+      // would turn a renewed session into a 403 on the user's next action.
+      global.fetch
+        .mockResolvedValueOnce(jsonResponse({}, { status: 401 }))
+        .mockResolvedValueOnce(jsonResponse({ success: true, data: { csrfToken: 'rotated' } }))
+        .mockResolvedValueOnce(jsonResponse({ success: true, data: {} }));
+
+      await client.dispatchOrders('w1');
+
+      expect(global.fetch.mock.calls[2][0]).toContain('/api/auth/refresh');
+      expect(global.fetch.mock.calls[3][1].headers['X-CSRF-Token']).toBe('rotated');
+    });
+
+    it('still attempts a refresh after a reload, with nothing readable to prove a session', async () => {
+      global.fetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'first' } })
+      );
+      await client.login({ email: 'a@b.com', password: 'secret' });
+
+      // The reload: no in-memory token any more, and still no cookie in
+      // reach. Reading that as "no session" logged the user out of a
+      // perfectly good session every time they refreshed the page more
+      // than an access token's 15 minutes after signing in.
+      const reloaded = await freshClient();
+
+      global.fetch
+        .mockResolvedValueOnce(jsonResponse({}, { status: 401 }))
+        .mockResolvedValueOnce(
+          jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'renewed' } })
+        )
+        .mockResolvedValueOnce(
+          jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'renewed' } })
+        );
+
+      await expect(reloaded.getCurrentUser()).resolves.toEqual({ id: 'u1' });
+      expect(global.fetch.mock.calls[2][0]).toContain('/api/auth/refresh');
+    });
+
+    it('still spends no refresh on a visitor who has never signed in', async () => {
+      global.fetch.mockResolvedValue(jsonResponse({}, { status: 401 }));
+
+      await expect(client.getCurrentUser()).resolves.toBeNull();
+
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('forgets the session on sign-out, so the next load does not try to refresh', async () => {
+      global.fetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: { user: { id: 'u1' }, csrfToken: 'first' } })
+      );
+      await client.login({ email: 'a@b.com', password: 'secret' });
+
+      global.fetch.mockResolvedValueOnce(jsonResponse({ success: true, data: { message: 'Signed out' } }));
+      await client.logout();
+
+      global.fetch.mockResolvedValue(jsonResponse({}, { status: 401 }));
+      await expect(client.getCurrentUser()).resolves.toBeNull();
+
+      // sign in, sign out, /auth/me - and no refresh behind it.
+      expect(global.fetch).toHaveBeenCalledTimes(3);
+    });
+  });
 });

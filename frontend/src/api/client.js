@@ -15,6 +15,11 @@ const CSRF_COOKIE = 'wrs_csrf';
 const CSRF_HEADER = 'X-CSRF-Token';
 const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
+/** Marks "this browser has signed in at some point", so a reload can tell a
+ * lapsed session from no session at all. Not a credential, and not trusted
+ * as one - the server's answer is still the only one that counts. */
+const SESSION_HINT_KEY = 'wrs_session';
+
 /**
  * Auth endpoints that must never trigger the silent-refresh retry below.
  *
@@ -38,9 +43,53 @@ const NO_REFRESH_RETRY = ['/auth/login', '/auth/register', '/auth/refresh', '/au
  * header on state-changing calls, which is the half a cross-site attacker
  * cannot forge. See backend/src/middleware/csrf.js.
  */
-function readCsrfToken() {
+let csrfToken = null;
+
+function readCsrfCookie() {
   const match = document.cookie.match(new RegExp(`(?:^|; )${CSRF_COOKIE}=([^;]*)`));
   return match ? decodeURIComponent(match[1]) : null;
+}
+
+/**
+ * The cookie was the only source until this app was deployed to two
+ * origins. It cannot be the only source there: the API sets the CSRF
+ * cookie from its own host, which makes it host-only to that host, so a
+ * page served from the frontend's origin cannot see it through
+ * `document.cookie` no matter how it is set. The browser still *sends*
+ * it, so the server saw a cookie-authenticated request carrying no
+ * header - exactly the shape it rejects - and every state-changing call
+ * in the deployed app failed with "Invalid or missing CSRF token".
+ *
+ * So the server also returns the token in the body of each call that
+ * establishes or confirms a session (register, login, refresh,
+ * /auth/me), and this holds the latest one. The cookie stays as the
+ * fallback, which is what a same-origin deployment and the Vite dev
+ * proxy still use.
+ */
+function readCsrfToken() {
+  return csrfToken || readCsrfCookie();
+}
+
+/** Takes the CSRF token out of a session response and records that this
+ * browser has a session. Returns its argument so it can wrap a call. */
+function rememberSession(data) {
+  if (data?.csrfToken) csrfToken = data.csrfToken;
+  try {
+    window.localStorage.setItem(SESSION_HINT_KEY, '1');
+  } catch {
+    // Storage disabled, or private mode. The hint is an optimisation and
+    // not a credential: without it the worst case is one wasted refresh.
+  }
+  return data;
+}
+
+function forgetSession() {
+  csrfToken = null;
+  try {
+    window.localStorage.removeItem(SESSION_HINT_KEY);
+  } catch {
+    // See rememberSession.
+  }
 }
 
 /** Notified when the server says the session is gone, so the app can drop
@@ -52,6 +101,9 @@ export function setUnauthenticatedHandler(handler) {
 }
 
 function notifyUnauthenticated() {
+  // Drop the token and the hint together: keeping either would send the
+  // next page load back through a refresh that cannot succeed.
+  forgetSession();
   if (onUnauthenticated) onUnauthenticated();
 }
 
@@ -70,10 +122,14 @@ let refreshInFlight = null;
 /**
  * Whether there is any point asking for a refresh.
  *
- * The refresh token itself is httpOnly and unreadable, but the CSRF cookie
- * is set alongside it, cleared with it, and given the same lifetime
- * (backend/src/utils/tokens.js) - so its absence is a reliable "this
- * browser has no session".
+ * The refresh token itself is httpOnly and unreadable. Same-origin, the
+ * CSRF cookie is set alongside it, cleared with it, and given the same
+ * lifetime (backend/src/utils/tokens.js), so its absence is a reliable
+ * "this browser has no session". Cross-origin that cookie is invisible
+ * to this code (see readCsrfToken), and reading its absence as "no
+ * session" meant a deployed tab reloaded more than an access token's 15
+ * minutes after signing in refused to even attempt the refresh that
+ * would have kept it signed in. The stored hint covers that case.
  *
  * This matters because /auth/refresh is behind the authentication rate
  * limiter (10 per 15 minutes per IP, counting failures). Without this
@@ -83,19 +139,32 @@ let refreshInFlight = null;
  * because logging in shares that budget. Found by the end-to-end suite,
  * which reloads the signed-out page more often than a person would.
  */
-function hasSessionCookies() {
-  return readCsrfToken() !== null;
+function hasSession() {
+  if (readCsrfToken() !== null) return true;
+  try {
+    return window.localStorage.getItem(SESSION_HINT_KEY) === '1';
+  } catch {
+    return false;
+  }
 }
 
 export function refreshSession() {
-  if (!hasSessionCookies()) return Promise.resolve(false);
+  if (!hasSession()) return Promise.resolve(false);
   if (!refreshInFlight) {
     refreshInFlight = fetch(`${API_BASE}/auth/refresh`, {
       method: 'POST',
       credentials: 'include',
       headers: { [CSRF_HEADER]: readCsrfToken() || '' },
     })
-      .then((res) => res.ok)
+      // A rotation issues a *new* CSRF token alongside the new cookies.
+      // Missing it would leave this holding the previous one and send
+      // that on every later write - a 403 on the first thing the user
+      // did after their session quietly renewed itself.
+      .then(async (res) => {
+        if (!res.ok) return false;
+        rememberSession((await res.json().catch(() => null))?.data);
+        return true;
+      })
       .catch(() => false)
       .finally(() => {
         refreshInFlight = null;
@@ -165,7 +234,7 @@ async function request(path, options = {}) {
   return body.data;
 }
 
-export { requestFull, request };
+export { requestFull, request, readCsrfToken };
 
 export function getHealth(options) {
   return request('/health', options);
@@ -173,16 +242,26 @@ export function getHealth(options) {
 
 // --- Authentication ----------------------------------------------------------
 
-export function register(payload) {
-  return request('/auth/register', { method: 'POST', body: JSON.stringify(payload) });
+export async function register(payload) {
+  return rememberSession(
+    await request('/auth/register', { method: 'POST', body: JSON.stringify(payload) })
+  );
 }
 
-export function login(payload) {
-  return request('/auth/login', { method: 'POST', body: JSON.stringify(payload) });
+export async function login(payload) {
+  return rememberSession(
+    await request('/auth/login', { method: 'POST', body: JSON.stringify(payload) })
+  );
 }
 
-export function logout() {
-  return request('/auth/logout', { method: 'POST' });
+export async function logout() {
+  try {
+    return await request('/auth/logout', { method: 'POST' });
+  } finally {
+    // Even if the request failed: the user asked to leave, and holding a
+    // stale token would only make the next sign-in's first write fail.
+    forgetSession();
+  }
 }
 
 /** Resolves to null rather than throwing when nobody is signed in - "not
@@ -190,6 +269,10 @@ export function logout() {
 export async function getCurrentUser(options) {
   try {
     const data = await requestFull('/auth/me', options);
+    // Where a reloaded tab gets its CSRF token back: this is the first
+    // call the app makes, and cross-origin it is the only place the
+    // token is reachable from.
+    rememberSession(data.data);
     return data.data?.user || null;
   } catch (err) {
     if (err.status === 401) return null;
