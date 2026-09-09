@@ -28,6 +28,8 @@
  *    firing doomed requests at it from a sign-in screen is noise.
  */
 
+import { readCsrfToken } from './client.js';
+
 const ENDPOINT = `${import.meta.env.VITE_API_URL || ''}/api/telemetry/client-errors`;
 
 /** Reports already sent this page load, keyed by message + location. The
@@ -115,10 +117,18 @@ export async function reportError(error, context = {}) {
     // both wrong here, where a failed report should simply be dropped
     // rather than triggering a token rotation or bouncing the user to a
     // sign-in screen because their error report did not land.
+    const csrf = readCsrfToken();
     const response = await fetch(ENDPOINT, {
       method: 'POST',
       credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      // A POST carrying session cookies still has to carry the CSRF
+      // header, or the server rejects it - so every report this made was
+      // silently 403ing. Not using request() does not exempt it from the
+      // rule, only from the retry behaviour the note above rules out.
+      headers: {
+        'Content-Type': 'application/json',
+        ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+      },
       body: JSON.stringify(payload),
       // The report must not keep the page alive, and must not be
       // cancelled by a navigation that happens because of the very error
