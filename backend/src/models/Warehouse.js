@@ -95,6 +95,51 @@ const warehouseSchema = new mongoose.Schema(
         message: 'One or more cells fall outside the warehouse bounds.',
       },
     },
+    /**
+     * Other people who may reach this warehouse, and how far.
+     *
+     * Ownership used to be the whole of the authorization model: one user
+     * per warehouse, no concept of a team, a viewer or a shared
+     * simulation. That is a reasonable default and a poor ceiling - a
+     * simulation is a thing you show people, and "send them your password"
+     * is the workaround it forced.
+     *
+     * Two roles, because there are exactly two questions worth asking:
+     *
+     *   viewer  - may read everything and watch the live simulation. May
+     *             not change anything, including starting or stopping it:
+     *             a viewer is an audience, and a simulation running is a
+     *             change to what everyone else is watching.
+     *   editor  - may do everything the owner can except the three things
+     *             that are about the warehouse's *existence* rather than
+     *             its contents: deleting it, changing its layout, and
+     *             changing who else can reach it.
+     *
+     * There is no `owner` role in this list. The owner is `ownerId`, it is
+     * immutable, and it is not something a collaborator can be granted -
+     * so no amount of sharing can produce a warehouse with two people who
+     * can each remove the other.
+     */
+    collaborators: {
+      type: [
+        new mongoose.Schema(
+          {
+            userId: {
+              type: mongoose.Schema.Types.ObjectId,
+              ref: 'User',
+              required: true,
+            },
+            role: { type: String, enum: ['viewer', 'editor'], required: true },
+            addedAt: { type: Date, default: Date.now },
+            // Recorded rather than derived: an owner can change, and "who
+            // let this person in" is the question that matters afterwards.
+            addedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+    },
     isActive: { type: Boolean, default: false },
     // Which of the 5 Milestone 7 strategies orderService.dispatchPendingOrders()
     // uses for this warehouse. Switchable via the existing PUT /:id endpoint -
@@ -111,6 +156,10 @@ const warehouseSchema = new mongoose.Schema(
 );
 
 warehouseSchema.index({ ownerId: 1, isActive: 1 });
+// Listing "warehouses I can reach" is an $or over ownership and
+// membership, and the membership half would otherwise be a collection
+// scan on every list request.
+warehouseSchema.index({ 'collaborators.userId': 1 });
 
 /**
  * Marks this warehouse active and deactivates every *other warehouse of

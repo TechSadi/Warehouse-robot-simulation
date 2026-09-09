@@ -80,12 +80,27 @@ afterAll((done) => {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  // User A owns OWNED_WAREHOUSE. User B owns OTHER_WAREHOUSE.
+  // User A owns OWNED_WAREHOUSE. User B owns OTHER_WAREHOUSE. Neither is
+  // shared with anyone, so "can reach it" and "owns it" coincide here -
+  // sharing has its own coverage in tests/security/sharing.test.js.
+  //
+  // The socket layer resolves access through `findAccessibleWarehouse`,
+  // whose filter is `{_id, $or: [{ownerId}, {'collaborators.userId'}]}`,
+  // so the asking user comes out of the $or rather than off `ownerId`.
   const owners = { [OWNED_WAREHOUSE]: USER_A_ID, [OTHER_WAREHOUSE]: USER_B_ID };
   Warehouse.findOne.mockImplementation((filter = {}) => {
     const owner = owners[String(filter._id)];
-    if (!owner || String(filter.ownerId) !== owner) return Promise.resolve(null);
-    return Promise.resolve({ _id: String(filter._id), ownerId: owner, rows: 20, cols: 20, cells: [] });
+    const asking = filter.ownerId ?? filter.$or?.[0]?.ownerId;
+    if (!owner || String(asking) !== owner) return Promise.resolve(null);
+    return Promise.resolve({
+      _id: String(filter._id),
+      ownerId: owner,
+      rows: 20,
+      cols: 20,
+      cells: [],
+      collaborators: [],
+      dynamicObstacles: [],
+    });
   });
 });
 

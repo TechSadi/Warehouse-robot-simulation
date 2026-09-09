@@ -6,6 +6,8 @@ const robotRoutes = require('./robot.routes');
 const orderRoutes = require('./order.routes');
 const statisticsRoutes = require('./statistics.routes');
 const logRoutes = require('./log.routes');
+const adminRoutes = require('./admin.routes');
+const telemetryRoutes = require('./telemetry.routes');
 
 const router = Router();
 
@@ -21,5 +23,10 @@ router.use('/robots', robotRoutes);
 router.use('/orders', orderRoutes);
 router.use('/statistics', statisticsRoutes);
 router.use('/logs', logRoutes);
+// Both gate themselves at the top of their own router, same as every
+// router above: /admin additionally requires the `admin` role, and
+// /telemetry is where the dashboard reports its own render failures.
+router.use('/admin', adminRoutes);
+router.use('/telemetry', telemetryRoutes);
 
 module.exports = router;

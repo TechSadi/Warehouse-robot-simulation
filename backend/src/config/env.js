@@ -128,9 +128,55 @@ const env = {
     issuer: process.env.JWT_ISSUER || 'warehouse-robot-simulation',
     audience: process.env.JWT_AUDIENCE || 'warehouse-robot-simulation-client',
     bcryptRounds: Number(process.env.BCRYPT_ROUNDS) || (isTest ? 4 : 12),
-    // Login throttling (credential stuffing / brute force).
+    // Login throttling (credential stuffing / brute force). Counted and
+    // applied *per source network* rather than per account, so lockout
+    // cannot be used to keep someone else out of their own account - see
+    // the `loginFailures` field in models/User.js.
     maxFailedLogins: Number(process.env.MAX_FAILED_LOGINS) || 8,
     lockoutSeconds: Number(process.env.LOGIN_LOCKOUT_SECONDS) || 15 * 60,
+    /** How many distinct source buckets one account tracks before the
+     * oldest are discarded. Bounds the growth an attacker rotating
+     * addresses can force on a single document. */
+    maxLoginFailureBuckets: Number(process.env.MAX_LOGIN_FAILURE_BUCKETS) || 20,
+
+    /** A reset token is a live credential - whoever holds it becomes the
+     * user - so it is short lived. A verification token is not, and a user
+     * may not read their mail for a day. */
+    passwordResetTtlSeconds: Number(process.env.PASSWORD_RESET_TTL_SECONDS) || 30 * 60,
+    emailVerificationTtlSeconds:
+      Number(process.env.EMAIL_VERIFICATION_TTL_SECONDS) || 24 * 60 * 60,
+    /**
+     * Whether an unverified address may use the API at all.
+     *
+     * Off by default, deliberately: turning it on without a working mail
+     * transport locks every account out of a system that was working a
+     * moment ago. Deployments that have configured MAIL_TRANSPORT should
+     * turn it on; the flow works either way, and `emailVerified` is
+     * reported to the client regardless.
+     */
+    requireEmailVerification: process.env.REQUIRE_EMAIL_VERIFICATION === 'true',
+
+    /** How many steps either side of the current one a TOTP code is
+     * accepted for. One (± 30 seconds) absorbs ordinary clock drift;
+     * widening it multiplies the guess space. */
+    totpWindow: Number(process.env.TOTP_WINDOW) || 1,
+    mfaRecoveryCodeCount: Number(process.env.MFA_RECOVERY_CODE_COUNT) || 10,
+  },
+
+  // --- Outbound mail ----------------------------------------------------
+  // See services/mailer.js. Production must choose explicitly: a reset
+  // link printed to a log is not a delivered email, and defaulting to
+  // `console` there would ship a password reset that silently does not
+  // work.
+  mail: {
+    transport: process.env.MAIL_TRANSPORT || (isProduction ? 'none' : 'console'),
+    webhookUrl: process.env.MAIL_WEBHOOK_URL || '',
+    webhookToken: process.env.MAIL_WEBHOOK_TOKEN || '',
+    webhookTimeoutMs: Number(process.env.MAIL_WEBHOOK_TIMEOUT_MS) || 5000,
+    /** Where the links in those emails point. The frontend owns
+     * /reset-password and /verify-email; this is its origin. */
+    appBaseUrl:
+      process.env.APP_BASE_URL || clientOrigins[0] || 'http://localhost:5173',
   },
 
   // --- Rate limiting ----------------------------------------------------
@@ -146,6 +192,18 @@ const env = {
     registrationsPerHour: isProduction
       ? 5
       : Number(process.env.REGISTER_RATE_LIMIT_MAX) || 5,
+    /**
+     * Where the limiter counters live.
+     *
+     * `express-rate-limit`'s default memory store is per process, so
+     * limits are neither shared across instances nor survive a redeploy -
+     * fine on a single free-tier instance, and a hole the moment there are
+     * two. `mongo` keeps them in the database this app already has, which
+     * makes them shared and durable without adding Redis to the stack.
+     * Defaults to mongo in production and memory elsewhere, because a test
+     * suite has no database and does not need shared counters anyway.
+     */
+    store: process.env.RATE_LIMIT_STORE || (isProduction ? 'mongo' : 'memory'),
   },
 
   cookies: {

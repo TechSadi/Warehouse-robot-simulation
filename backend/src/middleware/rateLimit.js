@@ -1,6 +1,7 @@
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const env = require('../config/env');
+const { MongoRateLimitStore } = require('./rateLimitStore');
 
 /**
  * Tiered rate limiting.
@@ -31,6 +32,24 @@ function keyGenerator(req) {
   return req.userId ? `user:${req.userId}` : `ip:${ipKey(req)}`;
 }
 
+/**
+ * Where the counters live.
+ *
+ * The default memory store is per process: limits are not shared across
+ * instances and reset on restart, so a second instance doubles every
+ * budget and a redeploy hands out fresh ones. `RATE_LIMIT_STORE=mongo`
+ * (the production default) puts them in the database this app already has
+ * - see middleware/rateLimitStore.js for why Mongo rather than Redis.
+ *
+ * Each limiter gets its own prefix so their key spaces cannot collide: two
+ * limiters that both key by IP would otherwise share one counter and
+ * silently enforce the tighter of the two on both.
+ */
+function storeFor(prefix) {
+  if (env.rateLimits.store !== 'mongo') return undefined; // memory store
+  return new MongoRateLimitStore({ prefix });
+}
+
 const shared = {
   standardHeaders: true, // RateLimit-* headers, so clients can back off politely
   legacyHeaders: false,
@@ -43,6 +62,7 @@ const shared = {
  * surface where guessing is worth something. */
 const authLimiter = rateLimit({
   ...shared,
+  store: storeFor('auth'),
   windowMs: 15 * 60 * 1000,
   max: 10,
   // Failed attempts are what we are budgeting; a user who signs in
@@ -69,6 +89,7 @@ const authLimiter = rateLimit({
  * override in production for exactly that reason. */
 const registerLimiter = rateLimit({
   ...shared,
+  store: storeFor('register'),
   windowMs: 60 * 60 * 1000,
   max: env.rateLimits.registrationsPerHour,
   keyGenerator: (req) => `register:${ipKey(req)}`,
@@ -78,6 +99,7 @@ const registerLimiter = rateLimit({
  * dashboard (polling health, listing robots/orders/logs) never comes close. */
 const apiLimiter = rateLimit({
   ...shared,
+  store: storeFor('api'),
   windowMs: 60 * 1000,
   max: 600,
   keyGenerator,
@@ -86,6 +108,7 @@ const apiLimiter = rateLimit({
 /** A* pathfinding: an unbounded search over an 80x80 grid per request. */
 const pathfindingLimiter = rateLimit({
   ...shared,
+  store: storeFor('path'),
   windowMs: 60 * 1000,
   max: 60,
   keyGenerator,
@@ -98,6 +121,7 @@ const pathfindingLimiter = rateLimit({
  * pathfindingLimiter, not instead of it. */
 const traceLimiter = rateLimit({
   ...shared,
+  store: storeFor('trace'),
   windowMs: 60 * 1000,
   max: 15,
   keyGenerator,
@@ -113,6 +137,7 @@ const traceLimiter = rateLimit({
 /** Order generation writes N documents per call. */
 const orderGenerationLimiter = rateLimit({
   ...shared,
+  store: storeFor('orders'),
   windowMs: 60 * 1000,
   max: 30,
   keyGenerator,
@@ -122,6 +147,7 @@ const orderGenerationLimiter = rateLimit({
  * every idle robot, then bulk-writes both sides. */
 const dispatchLimiter = rateLimit({
   ...shared,
+  store: storeFor('dispatch'),
   windowMs: 60 * 1000,
   max: 120,
   keyGenerator,
@@ -133,6 +159,7 @@ const dispatchLimiter = rateLimit({
  * being an unmetered way to run the engine flat out. */
 const tickLimiter = rateLimit({
   ...shared,
+  store: storeFor('tick'),
   windowMs: 60 * 1000,
   max: 240,
   keyGenerator,
@@ -142,14 +169,40 @@ const tickLimiter = rateLimit({
  * obstacles, logs, statistics). */
 const writeLimiter = rateLimit({
   ...shared,
+  store: storeFor('write'),
   windowMs: 60 * 1000,
   max: 200,
   keyGenerator,
 });
 
+/**
+ * Password reset, email verification and MFA changes.
+ *
+ * Tighter than `authLimiter` and on a longer window, because these
+ * endpoints are worth more to an attacker than a login attempt is. A reset
+ * request sends mail to an address the caller named, so an unlimited one
+ * is both an account-existence oracle and a way to use this service to
+ * spam a third party; and each one supersedes the previous token, so a
+ * flood is also a denial of service against a user genuinely trying to
+ * recover their account. Keyed by IP, since by definition the caller may
+ * not be signed in.
+ */
+const accountRecoveryLimiter = rateLimit({
+  ...shared,
+  store: storeFor('recovery'),
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  keyGenerator: (req) => `recovery:${ipKey(req)}`,
+  message: {
+    success: false,
+    error: { message: 'Too many account recovery requests. Please try again later.' },
+  },
+});
+
 module.exports = {
   authLimiter,
   registerLimiter,
+  accountRecoveryLimiter,
   apiLimiter,
   pathfindingLimiter,
   traceLimiter,

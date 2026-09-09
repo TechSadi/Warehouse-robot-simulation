@@ -7,7 +7,24 @@ describe('GET /api/health', () => {
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.data.service).toBe('warehouse-robot-simulation-backend');
-    expect(res.body.data).toHaveProperty('database');
+    expect(res.body.data.status).toBe('ok');
+  });
+
+  it('discloses nothing beyond liveness to an anonymous caller', () => {
+    // Uptime dates a deployment, and a database state flipping to
+    // `disconnected` says exactly when the service is least able to defend
+    // itself. Neither is something a platform health check needs.
+    return request(app)
+      .get('/api/health')
+      .then((res) => {
+        expect(res.body.data).not.toHaveProperty('database');
+        expect(res.body.data).not.toHaveProperty('uptimeSeconds');
+      });
+  });
+
+  it('requires a session for the operational detail', async () => {
+    const res = await request(app).get('/api/health/details');
+    expect(res.status).toBe(401);
   });
 });
 

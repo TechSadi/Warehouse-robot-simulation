@@ -108,12 +108,24 @@ beforeEach(() => {
   // build in this suite - the snapshot comes back empty, which is exactly
   // what a client joining a warehouse with nothing loaded should see.
   Warehouse.findById.mockResolvedValue(null);
-  // The test user owns both warehouses.
+  // The test user owns both warehouses. Access is resolved through
+  // `findAccessibleWarehouse`, whose filter is
+  // `{_id, $or: [{ownerId}, {'collaborators.userId'}]}`, so the asking
+  // user comes out of the $or rather than off a top-level `ownerId`.
   Warehouse.findOne.mockImplementation((filter = {}) => {
     const id = String(filter._id);
-    const owns = String(filter.ownerId) === USER_A_ID;
+    const asking = filter.ownerId ?? filter.$or?.[0]?.ownerId;
+    const owns = String(asking) === USER_A_ID;
     if (!owns || (id !== WAREHOUSE_A && id !== WAREHOUSE_B)) return Promise.resolve(null);
-    return Promise.resolve({ _id: id, ownerId: USER_A_ID, rows: 20, cols: 20, cells: [] });
+    return Promise.resolve({
+      _id: id,
+      ownerId: USER_A_ID,
+      rows: 20,
+      cols: 20,
+      cells: [],
+      collaborators: [],
+      dynamicObstacles: [],
+    });
   });
 });
 

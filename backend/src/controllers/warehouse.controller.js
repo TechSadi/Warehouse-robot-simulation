@@ -14,6 +14,9 @@ const orderService = require('../services/orderService');
 const tickRunner = require('../services/tickRunner');
 const warehouseLock = require('../services/warehouseLock');
 const simulationEvents = require('../events/simulationEvents');
+const { accessibleFilter, accessLevelFor } = require('../middleware/authorize');
+const User = require('../models/User');
+const audit = require('../services/securityAudit');
 
 /**
  * Fields a client may set on a warehouse. `ownerId` is conspicuously
@@ -34,6 +37,14 @@ const OBSTACLE_FIELDS = ['id', 'type', 'cells', 'durationSeconds'];
  * "non-negative" is not "inside this warehouse" - an out-of-bounds goal
  * would otherwise make A* explore the entire reachable grid before
  * reporting failure, which is a cheap way to burn server CPU. */
+/** A warehouse as a plain object, so the caller's access level can be
+ * appended to it. Tolerant of a document that is already plain - a `lean()`
+ * query and a test fixture both are, and neither should have to grow a
+ * `toObject` just to be serialisable. */
+function plain(warehouse) {
+  return typeof warehouse?.toObject === 'function' ? warehouse.toObject() : { ...warehouse };
+}
+
 function assertInBounds(warehouse, point, label) {
   if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
     throw new ApiError(400, `${label} must be a point with numeric x and y`);
@@ -45,10 +56,13 @@ function assertInBounds(warehouse, point, label) {
 
 const list = asyncHandler(async (req, res) => {
   const { page, limit, skip } = parsePagination(req.query);
-  // Scoped to the caller. Without the ownerId term this endpoint returned
-  // every warehouse on the deployment - both a listing of other tenants'
-  // data and a ready-made source of ObjectIds to probe.
-  const filter = { ownerId: req.userId };
+  // Scoped to the caller. Without this term the endpoint returned every
+  // warehouse on the deployment - both a listing of other tenants' data
+  // and a ready-made source of ObjectIds to probe. `accessibleFilter`
+  // covers warehouses shared *with* the caller as well as their own, and
+  // is the same filter the single-warehouse guards use, so a warehouse can
+  // never be listable but not readable (or the reverse).
+  const filter = { ...accessibleFilter(req.userId) };
   if (req.query.isActive !== undefined) filter.isActive = req.query.isActive === 'true';
 
   const [items, total] = await Promise.all([
@@ -56,14 +70,24 @@ const list = asyncHandler(async (req, res) => {
     Warehouse.countDocuments(filter),
   ]);
 
-  res.json({ success: true, data: items, meta: buildMeta({ page, limit, total }) });
+  res.json({
+    success: true,
+    // Each entry carries how far this caller reaches into it, so the
+    // client can render a shared warehouse read-only without having to
+    // discover that by getting a 403.
+    data: items.map((w) => ({ ...plain(w), access: accessLevelFor(w, req.userId) })),
+    meta: buildMeta({ page, limit, total }),
+  });
 });
 
 // requireWarehouseParam has already loaded and ownership-checked the
 // document into req.warehouse, so the handlers below never re-query by a
 // raw client-supplied id.
 const getOne = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: req.warehouse });
+  res.json({
+    success: true,
+    data: { ...plain(req.warehouse), access: req.warehouseAccess },
+  });
 });
 
 const create = asyncHandler(async (req, res) => {
@@ -309,7 +333,121 @@ const removeObstacle = asyncHandler(async (req, res) => {
   res.status(204).send();
 });
 
+/**
+ * Sharing.
+ *
+ * All three of these require `own` access (enforced at the route), which
+ * is the point: an editor can change everything *in* a warehouse and
+ * nothing about *who can reach it*. Otherwise the first person you shared
+ * with could share it onward, or remove you.
+ *
+ * Collaborators are addressed by email rather than by user id. A user id
+ * is not something one person knows about another, and an endpoint that
+ * turned an id into "yes, that account exists" would be an enumeration
+ * oracle over the whole user table. An email address is something the
+ * owner already has - and inviting an address that has no account answers
+ * exactly as if it does, for the same reason.
+ */
+const listCollaborators = asyncHandler(async (req, res) => {
+  const collaborators = req.warehouse.collaborators || [];
+  const users = await User.find({ _id: { $in: collaborators.map((c) => c.userId) } }).select(
+    'email name'
+  );
+  const byId = new Map(users.map((u) => [String(u._id), u]));
+
+  res.json({
+    success: true,
+    data: collaborators.map((c) => ({
+      userId: String(c.userId),
+      // A deleted account leaves a membership behind; report it rather
+      // than dropping the row, so the owner can see and remove it.
+      email: byId.get(String(c.userId))?.email ?? null,
+      name: byId.get(String(c.userId))?.name ?? null,
+      role: c.role,
+      addedAt: c.addedAt,
+    })),
+  });
+});
+
+const addCollaborator = asyncHandler(async (req, res) => {
+  const email = String(req.body.email).toLowerCase();
+  const role = req.body.role || 'viewer';
+
+  const invitee = await User.findOne({ email }).select('_id email name');
+  // Deliberately the same 200-shaped refusal whether the address has no
+  // account or already has access: this endpoint must not become a way to
+  // ask "does this person have an account here?".
+  if (!invitee || String(invitee._id) === String(req.warehouse.ownerId)) {
+    throw new ApiError(422, 'That address cannot be added to this warehouse');
+  }
+
+  // Upsert rather than reject-if-present: re-inviting someone at a
+  // different role is how a role is changed, and a separate PATCH for it
+  // would be a second write path into the same field.
+  const existing = (req.warehouse.collaborators || []).find(
+    (c) => String(c.userId) === String(invitee._id)
+  );
+  const updated = existing
+    ? await Warehouse.findOneAndUpdate(
+        { _id: req.warehouse._id, 'collaborators.userId': invitee._id },
+        { $set: { 'collaborators.$.role': role } },
+        { new: true }
+      )
+    : await Warehouse.findOneAndUpdate(
+        { _id: req.warehouse._id },
+        {
+          $push: {
+            collaborators: { userId: invitee._id, role, addedBy: req.userId, addedAt: new Date() },
+          },
+        },
+        { new: true }
+      );
+
+  audit.record('admin_action', {
+    req,
+    userId: req.userId,
+    email,
+    detail: { action: 'share_warehouse', warehouseId: String(req.warehouse._id), role },
+    outcome: 'success',
+  });
+
+  res.status(201).json({
+    success: true,
+    data: {
+      userId: String(invitee._id),
+      email: invitee.email,
+      name: invitee.name,
+      role,
+      collaborators: updated.collaborators.length,
+    },
+  });
+});
+
+const removeCollaborator = asyncHandler(async (req, res) => {
+  const updated = await Warehouse.findOneAndUpdate(
+    { _id: req.warehouse._id },
+    { $pull: { collaborators: { userId: req.params.userId } } },
+    { new: true }
+  );
+  if (!updated) throw new ApiError(404, 'Warehouse not found');
+
+  audit.record('admin_action', {
+    req,
+    userId: req.userId,
+    detail: {
+      action: 'unshare_warehouse',
+      warehouseId: String(req.warehouse._id),
+      target: String(req.params.userId),
+    },
+    outcome: 'success',
+  });
+  res.status(204).send();
+});
+
 module.exports = {
+  listCollaborators,
+  addCollaborator,
+  removeCollaborator,
   list,
   getOne,
   create,

@@ -10,7 +10,7 @@ const {
   optionalDeltaSeconds,
   optionalBoolean,
 } = require('./socketValidation');
-const { findOwnedWarehouse } = require('../middleware/authorize');
+const { findAccessibleWarehouse, ACCESS } = require('../middleware/authorize');
 const simulationManager = require('../services/simulationManager');
 
 /**
@@ -49,6 +49,11 @@ const simulationManager = require('../services/simulationManager');
  *     Checking at join time alone would leave `simulation:start` for an
  *     unjoined warehouse wide open - starting someone else's simulation
  *     does not require being able to see it.
+ *  6. The *level* required is named per event, not shared across them.
+ *     Warehouses can be shared (see models/Warehouse.js), and watching one
+ *     is not the same permission as driving it: a viewer joins the room
+ *     and receives everything broadcast to it, and cannot start or stop
+ *     the simulation everyone else in that room is watching.
  *
  * Resynchronisation (added in the reliability phase). Socket.IO reconnects
  * transparently, and a client that reconnects has *not* stayed
@@ -113,17 +118,20 @@ function initSockets(httpServer) {
      * then authorize - in that order, so an unauthorized caller spends its
      * own budget before it costs us a database round trip.
      */
-    function guarded(eventName, handler) {
+    function guarded(eventName, handler, { access = ACCESS.VIEW } = {}) {
       socket.on(eventName, async (payload) => {
         try {
           if (!limit(eventName)) return;
 
           const warehouseId = requireWarehouseId(payload);
-          const warehouse = await findOwnedWarehouse(warehouseId, socket.data.userId);
+          const warehouse = await findAccessibleWarehouse(warehouseId, socket.data.userId, access);
           if (!warehouse) {
             // Same non-committal wording as the REST 404: a client must
             // not be able to tell "does not exist" from "not yours" by
-            // sweeping ObjectIds over this socket.
+            // sweeping ObjectIds over this socket. Unlike the REST layer
+            // this does not distinguish "cannot reach" from "cannot reach
+            // far enough" - a socket client is not a person reading an
+            // error message, and one wording is one thing to get wrong.
             socket.emit('error:unauthorized', { event: eventName, message: 'Warehouse not found' });
             return;
           }
@@ -192,6 +200,8 @@ function initSockets(httpServer) {
     // is not an error - it means "I want this running", and it already is
     // - but a client that hears nothing back cannot tell that from a
     // request that was dropped.
+    // EDIT, not VIEW: starting or stopping changes what every other client
+    // in the room is watching, which is not something an audience does.
     guarded('simulation:start', ({ warehouseId, payload }) => {
       const deltaSeconds = optionalDeltaSeconds(payload);
       // Opt-in to running with nobody watching. Off by default, because
@@ -202,12 +212,12 @@ function initSockets(httpServer) {
       const background = optionalBoolean(payload, 'background') ?? false;
       const { started } = tickLoopManager.start(io, warehouseId, deltaSeconds, { background });
       socket.emit('simulation:status', { ...tickLoopManager.status(warehouseId), changed: started });
-    });
+    }, { access: ACCESS.EDIT });
 
     guarded('simulation:stop', ({ warehouseId }) => {
       const { stopped } = tickLoopManager.stop(io, warehouseId);
       socket.emit('simulation:status', { warehouseId, running: false, changed: stopped });
-    });
+    }, { access: ACCESS.EDIT });
 
     // Socket.IO removes a disconnecting socket from its rooms before the
     // 'disconnect' event fires, so the warehouse rooms it was watching

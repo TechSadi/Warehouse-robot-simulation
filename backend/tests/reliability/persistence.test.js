@@ -280,7 +280,13 @@ describe('bounding the engine cache', () => {
 
     await loadWarehouse('w1');
     await loadWarehouse('w2');
-    await simulationManager.getEngine('w1'); // w1 is now the more recent of the two
+    // Stamped apart explicitly: both loads land in the same millisecond,
+    // and a test that depends on Date.now()'s resolution to tell them
+    // apart is testing the clock rather than the eviction order.
+    simulationManager.lastUsedAt.set('w1', Date.now() - 10_000);
+    simulationManager.lastUsedAt.set('w2', Date.now() - 5_000);
+
+    await simulationManager.getEngine('w1'); // a cache *hit* refreshes recency
     await loadWarehouse('w3');
 
     expect(simulationManager.hasEngine('w2')).toBe(false);

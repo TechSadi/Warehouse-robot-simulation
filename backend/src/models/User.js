@@ -35,9 +35,76 @@ const userSchema = new mongoose.Schema(
     role: { type: String, enum: ROLES, default: 'user' },
 
     // --- Login throttling state (brute force / credential stuffing) ----
-    failedLoginAttempts: { type: Number, default: 0, select: false },
-    lockUntil: { type: Date, default: null, select: false },
+    /**
+     * Failed attempts, counted *per source network* rather than per
+     * account.
+     *
+     * A single account-wide counter made lockout a denial-of-service
+     * lever: anyone who knew a victim's email could keep the account
+     * locked with a stream of wrong passwords, and the victim could not
+     * sign in from anywhere. Bucketing by source keeps the defence where
+     * the attack is - a source that guesses wrong repeatedly is locked out
+     * of this account, and the real user, coming from somewhere else, is
+     * unaffected.
+     *
+     * The trade this makes is explicit: an attacker with many source
+     * addresses gets more guesses against one account than before. That is
+     * bounded by the per-IP rate limiter (middleware/rateLimit.js), which
+     * is the control actually suited to a distributed attack, and by
+     * `globalFailedLogins` below, which is what surfaces one.
+     *
+     * Bounded in length so the array cannot be grown without limit by an
+     * attacker rotating addresses - see recordFailedLogin.
+     */
+    loginFailures: {
+      type: [
+        new mongoose.Schema(
+          {
+            source: { type: String, required: true, maxlength: 64 },
+            attempts: { type: Number, default: 0 },
+            lockUntil: { type: Date, default: null },
+            lastAttemptAt: { type: Date, default: Date.now },
+          },
+          { _id: false }
+        ),
+      ],
+      default: [],
+      select: false,
+    },
+    /** Every failed attempt against this account, from anywhere. Not used
+     * to block - it is the number that says "this account is being
+     * attacked", which is worth recording precisely because per-source
+     * lockout deliberately does not act on it. */
+    globalFailedLogins: { type: Number, default: 0, select: false },
     lastLoginAt: { type: Date, default: null },
+
+    // --- Email verification --------------------------------------------
+    /** Null until the address is proven. Whether an unverified account may
+     * do anything is a deployment choice (REQUIRE_EMAIL_VERIFICATION), not
+     * a schema one - see middleware/auth.js. */
+    emailVerifiedAt: { type: Date, default: null },
+
+    // --- Multi-factor authentication ------------------------------------
+    /**
+     * The TOTP shared secret. `select: false` for the same reason as the
+     * password hash: it is a credential, and an accidental `res.json(user)`
+     * anywhere would hand over the second factor.
+     *
+     * Present but with `mfaEnabledAt` null means enrolment was started and
+     * never confirmed - the secret is generated when the user asks for a
+     * QR code, and only becomes load-bearing once they prove they can read
+     * codes from it.
+     */
+    mfaSecret: { type: String, default: null, select: false },
+    mfaEnabledAt: { type: Date, default: null },
+    /** bcrypt digests of the one-time recovery codes, never the codes.
+     * Consumed by removing the matching entry. */
+    mfaRecoveryCodes: { type: [String], default: [], select: false },
+    /** The last TOTP step accepted for this user. A code is valid for a
+     * whole 30-second step and for a window either side of it, so without
+     * this the same six digits - shoulder-surfed, or captured from a
+     * phished form - could be replayed within that window. */
+    mfaLastUsedStep: { type: Number, default: 0, select: false },
 
     // Bumping this invalidates every access token already issued to this
     // user without needing a server-side access-token blacklist - it's
@@ -52,8 +119,11 @@ const userSchema = new mongoose.Schema(
     toJSON: {
       transform(_doc, ret) {
         delete ret.passwordHash;
-        delete ret.failedLoginAttempts;
-        delete ret.lockUntil;
+        delete ret.loginFailures;
+        delete ret.globalFailedLogins;
+        delete ret.mfaSecret;
+        delete ret.mfaRecoveryCodes;
+        delete ret.mfaLastUsedStep;
         delete ret.__v;
         return ret;
       },
@@ -65,8 +135,24 @@ const userSchema = new mongoose.Schema(
 // model lowercases on write, so `Bob@example.com` and `bob@example.com`
 // cannot become two accounts.
 
-userSchema.virtual('isLocked').get(function isLocked() {
-  return Boolean(this.lockUntil && this.lockUntil.getTime() > Date.now());
+/** True while *this source* is locked out of this account. Lockout is per
+ * source by design - see the `loginFailures` field comment. */
+userSchema.methods.isLockedFor = function isLockedFor(source) {
+  const bucket = (this.loginFailures || []).find((b) => b.source === source);
+  return Boolean(bucket?.lockUntil && bucket.lockUntil.getTime() > Date.now());
+};
+
+/** Seconds until this source may try again, or 0. */
+userSchema.methods.lockSecondsFor = function lockSecondsFor(source) {
+  const bucket = (this.loginFailures || []).find((b) => b.source === source);
+  if (!bucket?.lockUntil) return 0;
+  return Math.max(0, Math.ceil((bucket.lockUntil.getTime() - Date.now()) / 1000));
+};
+
+/** True once MFA enrolment has been confirmed. A generated-but-unconfirmed
+ * secret does not count - see the `mfaSecret` field comment. */
+userSchema.virtual('mfaEnabled').get(function mfaEnabled() {
+  return Boolean(this.mfaEnabledAt);
 });
 
 /** Hashes a plaintext password. bcrypt (not a bare SHA) so each hash is
@@ -91,6 +177,11 @@ userSchema.methods.toPublicJSON = function toPublicJSON() {
     role: this.role,
     createdAt: this.createdAt,
     lastLoginAt: this.lastLoginAt,
+    // Both are facts about the caller's own account that the caller needs
+    // in order to render its own settings - not disclosure about anyone
+    // else, and never reachable for another user.
+    emailVerified: Boolean(this.emailVerifiedAt),
+    mfaEnabled: Boolean(this.mfaEnabledAt),
   };
 };
 

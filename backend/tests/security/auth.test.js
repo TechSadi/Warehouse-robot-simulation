@@ -16,14 +16,44 @@ jest.mock('../../src/models/User', () => {
   const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
   function decorate(doc) {
-    return Object.assign(doc, {
+    return withMfaFlag(Object.assign(doc, {
       verifyPassword(plaintext) {
         return bcrypt.compare(plaintext, doc.passwordHash);
       },
       toPublicJSON() {
-        return { id: String(doc._id), email: doc.email, name: doc.name, role: doc.role };
+        return {
+          id: String(doc._id),
+          email: doc.email,
+          name: doc.name,
+          role: doc.role,
+          emailVerified: Boolean(doc.emailVerifiedAt),
+          mfaEnabled: Boolean(doc.mfaEnabledAt),
+        };
       },
+      // Lockout is tracked per source network rather than per account, so
+      // one attacker cannot keep a victim out of their own account - see
+      // the `loginFailures` field in models/User.js.
+      isLockedFor(source) {
+        const bucket = (doc.loginFailures || []).find((b) => b.source === source);
+        return Boolean(bucket?.lockUntil && new Date(bucket.lockUntil).getTime() > Date.now());
+      },
+      lockSecondsFor(source) {
+        const bucket = (doc.loginFailures || []).find((b) => b.source === source);
+        if (!bucket?.lockUntil) return 0;
+        return Math.max(0, Math.ceil((new Date(bucket.lockUntil).getTime() - Date.now()) / 1000));
+      },
+    }));
+  }
+
+  // Defined rather than assigned: `Object.assign` reads a getter on the
+  // source and copies its *value*, which froze `mfaEnabled` as false at
+  // decoration time and quietly disabled every MFA check.
+  function withMfaFlag(doc) {
+    Object.defineProperty(doc, 'mfaEnabled', {
+      get: () => Boolean(doc.mfaEnabledAt),
+      configurable: true,
     });
+    return doc;
   }
 
   const model = {
@@ -45,8 +75,13 @@ jest.mock('../../src/models/User', () => {
         name: doc.name || '',
         role: doc.role || 'user',
         tokenVersion: 0,
-        failedLoginAttempts: 0,
-        lockUntil: null,
+        loginFailures: [],
+        globalFailedLogins: 0,
+        emailVerifiedAt: null,
+        mfaSecret: null,
+        mfaEnabledAt: null,
+        mfaRecoveryCodes: [],
+        mfaLastUsedStep: 0,
       });
       model.__store.set(id, record);
       return Promise.resolve(record);
@@ -55,9 +90,22 @@ jest.mock('../../src/models/User', () => {
       const record = model.__store.get(String(filter._id));
       if (record) {
         Object.assign(record, update.$set || {});
-        if (update.$inc?.tokenVersion) record.tokenVersion += update.$inc.tokenVersion;
+        for (const [field, amount] of Object.entries(update.$inc || {})) {
+          record[field] = (record[field] || 0) + amount;
+        }
+        // Successful login clears just *this* source's failure bucket, and
+        // a spent MFA recovery code is consumed by removal - both are
+        // $pull, so the stub has to understand it.
+        for (const [field, condition] of Object.entries(update.$pull || {})) {
+          const current = record[field] || [];
+          record[field] = current.filter((entry) =>
+            typeof condition === 'object' && condition !== null && !Array.isArray(condition)
+              ? !Object.entries(condition).every(([k, v]) => entry?.[k] === v)
+              : entry !== condition
+          );
+        }
       }
-      return Promise.resolve({ acknowledged: true });
+      return Promise.resolve({ acknowledged: true, modifiedCount: record ? 1 : 0 });
     }),
     updateMany: jest.fn().mockResolvedValue({ acknowledged: true }),
   };
@@ -87,7 +135,28 @@ jest.mock('../../src/models/RefreshToken', () => {
       model.__store.set(doc.tokenHash, record);
       return Promise.resolve(record);
     }),
-    findOne: jest.fn((filter) => Promise.resolve(model.__store.get(filter.tokenHash) || null)),
+    findOne: jest.fn((filter) => {
+      const promise = Promise.resolve(model.__store.get(filter.tokenHash) || null);
+      // `.select(...)` is used on the reuse-detection path.
+      promise.select = () => promise;
+      return promise;
+    }),
+    // Rotation consumes the presented token *before* issuing a successor,
+    // as one conditional update - see the comment on authService.refresh.
+    // The filter's `revokedAt: null` / `expiresAt` terms are what make it
+    // single-use, so the stub has to honour them rather than just looking
+    // the record up.
+    findOneAndUpdate: jest.fn((filter, update) => {
+      const record = model.__store.get(filter.tokenHash);
+      if (!record) return Promise.resolve(null);
+      if (filter.revokedAt === null && record.revokedAt) return Promise.resolve(null);
+      if (filter.expiresAt?.$gt && new Date(record.expiresAt) <= filter.expiresAt.$gt) {
+        return Promise.resolve(null);
+      }
+      const before = { ...record };
+      Object.assign(record, update.$set || {});
+      return Promise.resolve(before);
+    }),
     updateOne: jest.fn((filter, update) => {
       const record = filter.tokenHash
         ? model.__store.get(filter.tokenHash)
@@ -97,7 +166,10 @@ jest.mock('../../src/models/RefreshToken', () => {
     }),
     updateMany: jest.fn((filter, update) => {
       for (const record of model.__store.values()) {
-        if (record.family === filter.family) Object.assign(record, update.$set || {});
+        const matchesFamily = filter.family === undefined || record.family === filter.family;
+        const matchesUser =
+          filter.userId === undefined || String(record.userId) === String(filter.userId);
+        if (matchesFamily && matchesUser) Object.assign(record, update.$set || {});
       }
       return Promise.resolve({ acknowledged: true });
     }),
@@ -105,13 +177,63 @@ jest.mock('../../src/models/RefreshToken', () => {
   return model;
 });
 
+// Password reset and email verification hang single-use tokens off their
+// own collection - see models/VerificationToken.js.
+const verificationTokens = new Map();
+
+jest.mock('../../src/models/VerificationToken', () => {
+  const crypto = require('crypto');
+  const model = {
+    __store: null,
+    hashToken: (token) => crypto.createHash('sha256').update(token).digest('hex'),
+    create: jest.fn((doc) => {
+      const record = { _id: `vt${model.__store.size + 1}`, usedAt: null, ...doc };
+      model.__store.set(doc.tokenHash, record);
+      return Promise.resolve(record);
+    }),
+    // The `usedAt: null` term in the *filter* is what makes redemption
+    // single-use under a race, so the stub enforces it rather than
+    // matching on the hash alone.
+    findOneAndUpdate: jest.fn((filter, update) => {
+      const record = model.__store.get(filter.tokenHash);
+      if (!record) return Promise.resolve(null);
+      if (filter.purpose && record.purpose !== filter.purpose) return Promise.resolve(null);
+      if (filter.usedAt === null && record.usedAt) return Promise.resolve(null);
+      if (filter.expiresAt?.$gt && new Date(record.expiresAt) <= filter.expiresAt.$gt) {
+        return Promise.resolve(null);
+      }
+      Object.assign(record, update.$set || {});
+      return Promise.resolve(record);
+    }),
+    updateMany: jest.fn((filter, update) => {
+      for (const record of model.__store.values()) {
+        if (String(record.userId) !== String(filter.userId)) continue;
+        if (filter.purpose && record.purpose !== filter.purpose) continue;
+        if (filter.usedAt === null && record.usedAt) continue;
+        Object.assign(record, update.$set || {});
+      }
+      return Promise.resolve({ acknowledged: true });
+    }),
+  };
+  return model;
+});
+
+// The audit trail must never change an outcome, so it is stubbed out
+// wholesale here; tests/security/audit.test.js covers what it records.
+jest.mock('../../src/models/SecurityEvent', () => ({
+  create: jest.fn().mockResolvedValue({}),
+  TYPES: [],
+}));
+
 const User = require('../../src/models/User');
 const RefreshToken = require('../../src/models/RefreshToken');
+const VerificationToken = require('../../src/models/VerificationToken');
 const app = require('../../src/app');
 const { ACCESS_COOKIE, REFRESH_COOKIE, CSRF_COOKIE } = require('../../src/utils/tokens');
 
 User.__store = users;
 RefreshToken.__store = refreshTokens;
+VerificationToken.__store = verificationTokens;
 
 const GOOD_PASSWORD = 'Correct-Horse-9';
 
@@ -134,6 +256,7 @@ function cookieAttributes(res, name) {
 beforeEach(() => {
   users.clear();
   refreshTokens.clear();
+  verificationTokens.clear();
   jest.clearAllMocks();
 });
 
