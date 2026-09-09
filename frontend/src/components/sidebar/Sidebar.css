@@ -164,3 +164,48 @@
   font-size: 11px;
   color: var(--text-muted);
 }
+
+.sidebar__hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.robot-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Battery colour is a second signal, never the only one - the percentage is
+   printed next to the bar and the track carries a progressbar value, so a
+   colour-blind or screen-reader user gets the same information. */
+.robot-row__battery-fill--good {
+  background: var(--success);
+}
+.robot-row__battery-fill--warn {
+  background: var(--amber);
+}
+.robot-row__battery-fill--critical {
+  background: var(--danger);
+}
+
+.robot-row__status--moving {
+  color: var(--cyan);
+}
+.robot-row__status--charging {
+  color: var(--success);
+}
+.robot-row__status--error {
+  color: var(--danger);
+}
+
+.robot-row--error {
+  border-color: rgba(229, 72, 77, 0.35);
+}
+
+@media (pointer: coarse) {
+  .sidebar__palette-item {
+    min-height: 42px;
+  }
+}

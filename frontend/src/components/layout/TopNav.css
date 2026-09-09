@@ -1,12 +1,14 @@
 .top-nav {
-  height: var(--nav-height);
+  min-height: var(--nav-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 20px;
+  gap: 12px;
+  padding: 8px 20px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--line);
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .top-nav__brand {
@@ -32,6 +34,14 @@
   display: flex;
   align-items: center;
   gap: 16px;
+  flex-wrap: wrap;
+}
+
+.top-nav__status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .top-nav__clock {
@@ -66,19 +76,42 @@
   padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid var(--line-bright);
+  white-space: nowrap;
+}
+
+.status-pill--button {
+  cursor: pointer;
+  font-family: var(--font-mono);
 }
 
 .status-pill__dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
+  flex-shrink: 0;
 }
 
-.status-checking {
-  color: var(--text-secondary);
+/* Waiting on an answer - neither good news nor bad. Amber rather than grey
+   so "connecting" and "unreachable" are distinguishable at a glance, and
+   the dot pulses so a stuck connection looks different from a settled one. */
+.status-pending {
+  color: var(--amber);
+  border-color: rgba(245, 166, 35, 0.35);
+  background: var(--amber-soft);
 }
-.status-checking .status-pill__dot {
-  background: var(--text-muted);
+.status-pending .status-pill__dot {
+  background: var(--amber);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
 }
 
 .status-online {
@@ -128,7 +161,50 @@
   cursor: pointer;
 }
 
-.top-nav__signout-btn:hover {
+.top-nav__signout-btn:hover:not(:disabled) {
   color: var(--amber);
   border-color: var(--amber);
+}
+
+.top-nav__signout-btn:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+/* Below ~900px the clock is the first thing worth losing: it is decoration,
+   while both status pills and the account controls are not. */
+@media (max-width: 900px) {
+  .top-nav {
+    padding: 8px 12px;
+  }
+
+  .top-nav__meta {
+    gap: 10px;
+  }
+
+  .top-nav__clock {
+    display: none;
+  }
+
+  .top-nav__account {
+    padding-left: 10px;
+  }
+}
+
+@media (max-width: 600px) {
+  .top-nav__title {
+    font-size: 14px;
+  }
+
+  .top-nav__brand .eyebrow {
+    display: none;
+  }
+
+  .top-nav__shortcuts-btn {
+    display: none;
+  }
+
+  .top-nav__user {
+    max-width: 100px;
+  }
 }

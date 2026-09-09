@@ -74,7 +74,7 @@
   gap: 6px;
 }
 
-.auth-gate__field span {
+.auth-gate__field label {
   font-family: var(--font-mono);
   font-size: 11px;
   letter-spacing: 0.06em;
@@ -150,4 +150,53 @@
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--text-muted);
+}
+
+.auth-gate__loading {
+  gap: 10px;
+}
+
+.auth-gate__loading-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line-bright);
+  border-top-color: var(--cyan);
+  animation: auth-spin 0.7s linear infinite;
+}
+
+@keyframes auth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* `:focus` alone removed the outline for keyboard users too. Keep the amber
+   border as the resting focus affordance, and restore a real ring when the
+   browser says the focus came from a keyboard. */
+.auth-gate__field input:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 1px;
+}
+
+.auth-gate__submit:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (pointer: coarse) {
+  .auth-gate__field input {
+    font-size: 16px;
+    padding: 11px 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .auth-gate {
+    padding: 16px;
+  }
+
+  .auth-gate__panel {
+    padding: 24px 20px;
+  }
 }

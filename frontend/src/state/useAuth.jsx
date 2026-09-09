@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import * as api from '../api/client.js';
-import { socket, reconnectSocket } from '../api/socket.js';
+import { realtime } from '../api/realtime.js';
 
 /**
  * Session state for the whole app.
@@ -14,58 +14,81 @@ import { socket, reconnectSocket } from '../api/socket.js';
  * On mount it asks the server who the caller is rather than trusting
  * anything cached locally: a client-side "am I logged in" flag is a
  * decoration, and the server's answer is the only one that matters.
+ *
+ * It carries exactly three things - `user`, `status`, and the three actions
+ * that change them. It used to also expose an `error`/`setError` pair that
+ * nothing ever wrote to, while the sign-in form kept its own error state
+ * next to it; two places to look for the same fact, one of them always
+ * empty. The form's own state is the real one, so this no longer pretends
+ * to hold it.
  */
 const AuthContext = createContext(null);
 
+export const AUTH_STATUS = {
+  LOADING: 'loading',
+  AUTHENTICATED: 'authenticated',
+  ANONYMOUS: 'anonymous',
+};
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
-  const [status, setStatus] = useState('loading'); // loading | authenticated | anonymous
-  const [error, setError] = useState(null);
+  const [status, setStatus] = useState(AUTH_STATUS.LOADING);
 
   const applySession = useCallback((nextUser) => {
     setUser(nextUser);
-    setStatus(nextUser ? 'authenticated' : 'anonymous');
+    setStatus(nextUser ? AUTH_STATUS.AUTHENTICATED : AUTH_STATUS.ANONYMOUS);
+  }, []);
+
+  const endSession = useCallback(() => {
+    setUser(null);
+    setStatus(AUTH_STATUS.ANONYMOUS);
+    realtime.disconnect();
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
     let cancelled = false;
 
-    // The API client calls this when the server reports the session is
-    // gone - an expired refresh token, a "sign out everywhere", a revoked
-    // session - so the UI drops straight back to the sign-in screen
-    // instead of showing a wall of failed requests.
-    api.setUnauthenticatedHandler(() => {
+    // Called when the server reports the session is gone - an expired
+    // refresh token, a "sign out everywhere", a revoked session - so the UI
+    // drops straight back to the sign-in screen instead of showing a wall
+    // of failed requests. Both transports report it: REST through the API
+    // client, and the socket through the realtime client, which reaches
+    // this only after its own refresh-and-retry has failed.
+    const handleSessionLost = () => {
       if (cancelled) return;
-      setUser(null);
-      setStatus('anonymous');
-      if (socket.connected) socket.disconnect();
-    });
+      endSession();
+    };
+    api.setUnauthenticatedHandler(handleSessionLost);
+    realtime.setUnauthorizedHandler(handleSessionLost);
 
     api
-      .getCurrentUser()
+      .getCurrentUser({ signal: controller.signal })
       .then((current) => {
         if (cancelled) return;
         applySession(current);
-        if (current) reconnectSocket();
+        if (current) realtime.connect();
       })
-      .catch(() => {
-        if (!cancelled) applySession(null);
+      .catch((err) => {
+        if (cancelled || err?.name === 'AbortError') return;
+        applySession(null);
       });
 
     return () => {
       cancelled = true;
+      controller.abort();
       api.setUnauthenticatedHandler(null);
+      realtime.setUnauthorizedHandler(null);
     };
-  }, [applySession]);
+  }, [applySession, endSession]);
 
   const signIn = useCallback(
     async (credentials) => {
-      setError(null);
       const data = await api.login(credentials);
       applySession(data.user);
       // The socket handshake is authenticated once, at connect time, so an
       // existing connection has to be replaced rather than reused.
-      reconnectSocket();
+      realtime.connect();
       return data.user;
     },
     [applySession]
@@ -73,10 +96,9 @@ export function AuthProvider({ children }) {
 
   const signUp = useCallback(
     async (details) => {
-      setError(null);
       const data = await api.register(details);
       applySession(data.user);
-      reconnectSocket();
+      realtime.connect();
       return data.user;
     },
     [applySession]
@@ -89,14 +111,13 @@ export function AuthProvider({ children }) {
       // Drop the session locally even if the request failed - leaving the
       // UI in a signed-in state after the user asked to leave is worse
       // than a redundant sign-out.
-      applySession(null);
-      if (socket.connected) socket.disconnect();
+      endSession();
     }
-  }, [applySession]);
+  }, [endSession]);
 
   const value = useMemo(
-    () => ({ user, status, error, setError, signIn, signUp, signOut }),
-    [user, status, error, signIn, signUp, signOut]
+    () => ({ user, status, signIn, signUp, signOut }),
+    [user, status, signIn, signUp, signOut]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

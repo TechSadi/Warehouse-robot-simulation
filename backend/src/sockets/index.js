@@ -78,7 +78,19 @@ function initSockets(httpServer) {
     maxHttpBufferSize: 64 * 1024,
     // Drop connections that stop responding rather than holding the
     // room/tick-loop state they are keeping alive.
-    pingTimeout: 20000,
+    //
+    // Both halves of the heartbeat are set, and both are shorter than the
+    // defaults, because these values are what decides how long *either*
+    // side keeps believing in a connection that is already gone. The server
+    // sends them to the client during the handshake, so they also govern
+    // how fast a browser notices - with the defaults (25s interval, this
+    // 20s timeout) a client whose network vanished went on displaying a
+    // frozen fleet under a "Live" label for up to 45 seconds. At 10s/10s
+    // that worst case is 20 seconds, for one extra heartbeat frame per
+    // socket per 15 seconds, which is nothing next to a tick broadcast
+    // twice a second.
+    pingInterval: 10000,
+    pingTimeout: 10000,
   });
 
   io.use(socketAuthMiddleware);

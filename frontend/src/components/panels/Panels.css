@@ -8,24 +8,32 @@
   gap: 10px;
 }
 
-.panel__empty {
-  border: 1px dashed var(--line-bright);
-  border-radius: var(--panel-radius);
-  padding: 12px;
-  color: var(--text-secondary);
-  font-size: 13px;
+/* Panel headings are real headings (h2/h3) now rather than styled
+   paragraphs, so a screen reader can navigate the dashboard by heading.
+   They keep the eyebrow look; only the semantics changed. */
+.panel__heading {
+  font-size: 11px;
+  font-weight: 500;
+  margin: 0;
 }
 
-.panel__empty-hint {
+.panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.panel__footnote {
+  font-size: 11px;
   color: var(--text-muted);
-  font-size: 12px;
-  line-height: 1.5;
 }
 
 .stat-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+  margin: 0;
 }
 
 .stat-tile {
@@ -42,6 +50,7 @@
   font-size: 20px;
   font-weight: 500;
   color: var(--cyan);
+  margin: 0;
 }
 
 .stat-tile__label {
@@ -50,11 +59,11 @@
   letter-spacing: 0.02em;
 }
 
-/* --- Control panel: grid/zoom/serialization controls --- */
+/* --- Controls ------------------------------------------------------------- */
 
 .control-row {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
   flex-wrap: wrap;
 }
@@ -64,6 +73,7 @@
   text-align: center;
   font-size: 13px;
   color: var(--text-secondary);
+  align-self: center;
 }
 
 .control-field {
@@ -75,42 +85,55 @@
   width: 64px;
 }
 
-.control-field input {
-  width: 100%;
-  background: var(--bg-panel-raised);
-  border: 1px solid var(--line);
-  border-radius: var(--panel-radius);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  padding: 6px 8px;
+.control-field label {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
-.control-field input:focus-visible {
-  border-color: var(--cyan);
-}
-
-.control-field--wide {
-  width: 100%;
-}
-
+.control-field input,
 .control-field select {
   width: 100%;
   background: var(--bg-panel-raised);
   border: 1px solid var(--line);
   border-radius: var(--panel-radius);
   color: var(--text-primary);
-  font-family: var(--font-body);
   font-size: 13px;
+  /* 16px on coarse pointers below - iOS zooms the page in on any focused
+     input smaller than that, which on this layout means zooming into a
+     control and losing the grid. */
+  padding: 6px 8px;
+}
+
+.control-field input {
+  font-family: var(--font-mono);
+}
+
+.control-field select {
+  font-family: var(--font-body);
   padding: 7px 8px;
 }
 
+.control-field input:focus-visible,
 .control-field select:focus-visible {
   border-color: var(--cyan);
 }
 
-.panel__empty-hint--error {
-  color: var(--danger);
+.control-field input:disabled,
+.control-field select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.control-field--wide {
+  width: 100%;
+}
+
+.control-field input[type='range'] {
+  width: 100%;
+  accent-color: var(--cyan);
+  background: transparent;
+  border: none;
+  padding: 0;
 }
 
 .panel__button {
@@ -121,21 +144,64 @@
   font-size: 12px;
   font-weight: 500;
   padding: 7px 12px;
-  transition: border-color 0.12s ease, color 0.12s ease;
+  /* Comfortable enough to hit with a thumb without making the desktop rail
+     feel like a mobile app. */
+  min-height: 32px;
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
 }
 
-.panel__button:hover {
+.panel__button:hover:not(:disabled) {
   border-color: var(--cyan);
   color: var(--text-primary);
 }
 
-.panel__button--danger:hover {
+/* Disabled controls have to *look* unavailable, not just refuse the click -
+   the previous buttons stayed fully lit while doing nothing. */
+.panel__button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.panel__button--primary {
+  border-color: rgba(61, 218, 215, 0.5);
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+
+.panel__button--danger:hover:not(:disabled) {
   border-color: var(--danger);
   color: var(--danger);
 }
 
+.panel__button--active {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  background: var(--cyan-soft);
+}
+
+.panel__button--quiet {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  min-height: 0;
+}
+
+.panel__button--quiet:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--line-bright);
+}
+
 .panel__file-input {
-  display: none;
+  /* Not display:none - a visually hidden input stays focusable and keeps
+     its label association, which display:none removes. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .panel__inspector {
@@ -143,40 +209,126 @@
   padding-top: 10px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
 }
 
-.panel__banner {
+.panel__checkbox {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.panel__checkbox input {
+  accent-color: var(--cyan);
+  width: 15px;
+  height: 15px;
+}
+
+/* --- Simulation run state ------------------------------------------------- */
+
+.run-state {
+  display: flex;
+  align-items: center;
   gap: 8px;
   padding: 8px 10px;
   border-radius: var(--panel-radius);
+  border: 1px solid var(--line-bright);
+  background: var(--bg-panel-raised);
   font-size: 12px;
 }
 
-.panel__banner--error {
-  background: var(--danger-soft);
-  border: 1px solid rgba(229, 72, 77, 0.35);
-  color: var(--danger);
+.run-state__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
 }
 
-.panel__banner-dismiss {
-  background: none;
-  border: none;
-  color: inherit;
-  font-size: 16px;
-  line-height: 1;
-  padding: 0 2px;
+.run-state--running {
+  border-color: rgba(74, 222, 128, 0.4);
+  background: var(--success-soft);
 }
 
-.order-list {
+.run-state--running .run-state__dot {
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+  animation: run-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.run-state__label {
+  flex: 1;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.run-state--running .run-state__label {
+  color: var(--success);
+}
+
+.run-state__link {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  opacity: 0.85;
+}
+
+.run-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin: 0;
+}
+
+.run-summary__item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.run-summary__item dt {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.run-summary__item dd {
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+/* --- Orders --------------------------------------------------------------- */
+
+.order-list,
+.notification-list,
+.obstacle-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
   max-height: 220px;
   overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
 }
 
 .order-row {
@@ -199,10 +351,22 @@
   border-radius: 999px;
   flex-shrink: 0;
 }
-.order-row__priority--urgent { background: var(--danger-soft); color: var(--danger); }
-.order-row__priority--high { background: var(--amber-soft); color: var(--amber); }
-.order-row__priority--normal { background: var(--line); color: var(--text-secondary); }
-.order-row__priority--low { background: var(--line); color: var(--text-muted); }
+.order-row__priority--urgent {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.order-row__priority--high {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+.order-row__priority--normal {
+  background: var(--line);
+  color: var(--text-secondary);
+}
+.order-row__priority--low {
+  background: var(--line);
+  color: var(--text-muted);
+}
 
 .order-row__status {
   color: var(--text-secondary);
@@ -216,6 +380,8 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* --- Chart ---------------------------------------------------------------- */
 
 .chart-wrap {
   display: flex;
@@ -257,28 +423,7 @@
   margin-bottom: 2px;
 }
 
-.panel__checkbox {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-.panel__checkbox input {
-  accent-color: var(--cyan);
-}
-
-/* --- Notifications feed (Milestone 11) ----------------------------------- */
-
-.notification-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 220px;
-  overflow-y: auto;
-}
+/* --- Notifications and logs ----------------------------------------------- */
 
 .notification-row {
   display: flex;
@@ -299,9 +444,22 @@
   margin-top: 4px;
 }
 
-.notification-row__dot--info { background: var(--cyan); }
-.notification-row__dot--warn { background: var(--amber); }
-.notification-row__dot--error { background: var(--danger); }
+.notification-row__dot--info {
+  background: var(--cyan);
+}
+.notification-row__dot--warn {
+  background: var(--amber);
+}
+.notification-row__dot--error {
+  background: var(--danger);
+}
+
+.notification-row--warn {
+  border-color: rgba(245, 166, 35, 0.3);
+}
+.notification-row--error {
+  border-color: rgba(229, 72, 77, 0.3);
+}
 
 .notification-row__message {
   flex: 1;
@@ -318,23 +476,76 @@
   font-size: 14px;
   line-height: 1;
   cursor: pointer;
-  padding: 0 2px;
+  padding: 2px 4px;
+  border-radius: 3px;
 }
 
 .notification-row__dismiss:hover {
   color: var(--text-primary);
 }
 
-/* --- AI Visualisation panel (Milestone 12) -------------------------------- */
-
-.panel__button--active {
-  border-color: var(--cyan);
-  color: var(--cyan);
-  background: var(--cyan-soft);
+.log-row__meta {
+  color: var(--text-muted);
 }
+
+/* --- Dynamic obstacles ---------------------------------------------------- */
+
+.obstacle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--panel-radius);
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.obstacle-row__swatch {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--text-muted);
+}
+
+/* Matches the hatch colours GridCanvas draws for each obstacle type, so the
+   list and the floor plan agree at a glance. */
+.obstacle-row__swatch--human_worker {
+  background: var(--amber);
+}
+.obstacle-row__swatch--temporary_obstacle {
+  background: var(--text-muted);
+}
+.obstacle-row__swatch--broken_robot {
+  background: var(--danger);
+}
+.obstacle-row__swatch--construction_zone {
+  background: var(--cyan);
+}
+
+.obstacle-row__info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.obstacle-row__type {
+  color: var(--text-primary);
+}
+
+.obstacle-row__meta {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* --- Path visualisation --------------------------------------------------- */
 
 .viz-cell-readout {
   flex: 1;
+  min-width: 110px;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -351,15 +562,30 @@
   letter-spacing: 0.04em;
 }
 
-.control-field input[type='range'] {
-  width: 100%;
-  accent-color: var(--cyan);
-  background: transparent;
-  border: none;
-  padding: 0;
+.viz-cell-readout__value {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--text-primary);
 }
 
-/* --- Saved layouts panel (Milestone 13) ----------------------------------- */
+.viz-cell-readout__clear {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 3px;
+  border-radius: 3px;
+}
+
+.viz-cell-readout__clear:hover {
+  color: var(--danger);
+}
+
+/* --- Saved layouts -------------------------------------------------------- */
 
 .layout-browser {
   display: flex;
@@ -378,6 +604,7 @@
   border-radius: var(--panel-radius);
   background: var(--bg-panel-raised);
   border: 1px solid var(--line);
+  flex-wrap: wrap;
 }
 
 .layout-row--active {
@@ -389,14 +616,29 @@
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  flex: 1;
 }
 
 .layout-row__name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 13px;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.layout-row__badge {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  border-radius: 999px;
+  padding: 1px 5px;
 }
 
 .layout-row__meta {
@@ -406,10 +648,33 @@
 
 .layout-row__actions {
   display: flex;
+  align-items: center;
   gap: 6px;
   flex-shrink: 0;
 }
 
-.log-row__meta {
-  color: var(--text-muted);
+.layout-row__confirm {
+  font-size: 11px;
+  color: var(--danger);
+}
+
+/* Touch pointers get larger targets and 16px inputs (see the note above on
+   iOS focus zoom). Keyed on pointer, not width - a small window on a
+   desktop still has a mouse. */
+@media (pointer: coarse) {
+  .panel__button {
+    min-height: 40px;
+    padding: 9px 14px;
+  }
+
+  .control-field input,
+  .control-field select {
+    font-size: 16px;
+    padding: 9px 10px;
+  }
+
+  .notification-row__dismiss,
+  .viz-cell-readout__clear {
+    padding: 6px 8px;
+  }
 }

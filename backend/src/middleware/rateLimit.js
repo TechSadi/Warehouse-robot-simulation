@@ -56,11 +56,21 @@ const authLimiter = rateLimit({
 });
 
 /** Account creation, keyed by IP - slows bulk account farming and bounds
- * how fast the registration endpoint can be probed for existing emails. */
+ * how fast the registration endpoint can be probed for existing emails.
+ *
+ * The ceiling is overridable purely so a browser-driven end-to-end suite
+ * can run against a disposable dev or staging backend: those tests register
+ * real accounts through the real form, and five per hour per IP is -
+ * correctly - fewer than such a suite needs. Same reasoning and the same
+ * pattern as TICK_INTERVAL_MS. The default is the production value and
+ * production must keep it: raising this on a real deployment turns
+ * registration back into a usable oracle for which emails have accounts,
+ * which is the thing this limit exists to prevent. env.js refuses the
+ * override in production for exactly that reason. */
 const registerLimiter = rateLimit({
   ...shared,
   windowMs: 60 * 60 * 1000,
-  max: 5,
+  max: env.rateLimits.registrationsPerHour,
   keyGenerator: (req) => `register:${ipKey(req)}`,
 });
 

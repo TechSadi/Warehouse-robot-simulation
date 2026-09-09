@@ -10,3 +10,11 @@
   touch-action: none;
   cursor: crosshair;
 }
+
+/* The canvas is focusable (arrow keys move the selected cell, Enter places,
+   Delete clears), so it needs a focus ring like any other control. Inset
+   rather than outset because the canvas fills its frame edge to edge. */
+.grid-canvas canvas:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: -2px;
+}

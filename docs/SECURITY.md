@@ -647,6 +647,6 @@ must be listed too (they get distinct hostnames).
 ### Verification
 
 ```bash
-cd backend  && npm test          # 434 tests, incl. 165 security tests
+cd backend  && npm test          # 519 tests, incl. 165 security tests
 cd frontend && npm run build
 ```

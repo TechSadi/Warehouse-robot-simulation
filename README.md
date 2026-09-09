@@ -51,6 +51,8 @@ is preserved in [`docs/DEVELOPMENT_LOG.md`](./docs/DEVELOPMENT_LOG.md).
 | [`docs/API.md`](./docs/API.md) | Every REST endpoint and Socket.IO event, with request/response shapes |
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | System diagram, component responsibilities, the tick loop, the real-time event bus, known limitations, security notes |
 | [`docs/SIMULATION_ARCHITECTURE.md`](./docs/SIMULATION_ARCHITECTURE.md) | The simulation core: which system owns which state, the tick mechanism, the per-warehouse concurrency model, the robot and order state machines, restart recovery, Socket.IO resynchronisation, A* cost controls |
+| [`docs/FRONTEND_ARCHITECTURE.md`](./docs/FRONTEND_ARCHITECTURE.md) | The dashboard: server-owned vs client state, the connection lifecycle, error and empty states, the three testing layers |
+| [`docs/SECURITY.md`](./docs/SECURITY.md) | Threat model, authentication and authorization model, and what is deliberately out of scope |
 | [`docs/ER_DIAGRAM.md`](./docs/ER_DIAGRAM.md) | MongoDB collections and how they relate |
 | [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) | Step-by-step: MongoDB Atlas → backend (Render/Railway) → frontend (Vercel/Netlify) |
 | [`docs/DEVELOPMENT_LOG.md`](./docs/DEVELOPMENT_LOG.md) | The full milestone-by-milestone build history |
@@ -89,16 +91,18 @@ warehouse-robot-simulation/
 │   │   └── server.js      # HTTP server entry point
 │   ├── scripts/
 │   │   └── benchmark.js   # Fleet-scale tick-throughput benchmark, no MongoDB required
-│   ├── tests/             # Jest + Supertest - 265 tests
+│   ├── tests/             # Jest + Supertest - 519 tests
 │   ├── .env.example
 │   └── package.json
 ├── frontend/
 │   ├── src/
-│   │   ├── api/            # REST client + socket.js (shared Socket.IO client)
+│   │   ├── api/            # REST client, ApiError normalisation, realtime.js (socket lifecycle manager)
 │   │   ├── engine/
 │   │   │   ├── grid/       # Pure grid engine: create/resize/set/serialize
 │   │   │   └── grid/warehouseGenerator.js  # Procedural aisle/shelf/charging/dock layout generator
 │   │   ├── state/
+│   │   │   ├── simulationReducer.js  # Every mutation of server-owned state (robots, orders, obstacles, running)
+│   │   │   ├── useConnection.js      # API reachability and realtime status, reported separately
 │   │   │   ├── useSimulationGrid.js  # Grid + tool + selection + backend sync + saved-layouts state
 │   │   │   ├── useLiveSimulation.js  # Socket.IO-driven robots/orders/obstacles/notifications, heatmap/history
 │   │   │   ├── usePathVisualization.js  # AI Visualisation Panel: start/goal picking, traced A* run, step playback
@@ -107,16 +111,21 @@ warehouse-robot-simulation/
 │   │   │   ├── layout/     # AppShell, TopNav, ShortcutsHelp overlay
 │   │   │   ├── sidebar/    # Fleet roster (live robot list) / tool palette
 │   │   │   ├── simulation/ # SimulationCanvas frame + GridCanvas renderer (grid, robots, obstacles, A* search, heatmap)
-│   │   │   └── panels/     # Control panel, statistics, orders, notifications, AI visualisation, saved layouts, logs, chart
+│   │   │   ├── common/     # ErrorBoundary, shared loading/empty/error/banner feedback
+│   │   │   └── panels/     # Simulation + warehouse controls, obstacles, statistics, orders, notifications, AI visualisation, saved layouts, logs, chart
+│   │   ├── utils/          # format.js - status labels and number formatting shared by every panel
 │   │   ├── theme.js        # Color tokens mirrored from index.css (for canvas)
 │   │   ├── App.jsx
 │   │   └── main.jsx
+│   ├── tests/              # Vitest + Testing Library - 317 tests; tests/e2e is Playwright
 │   ├── index.html
-│   ├── vite.config.js
+│   ├── vite.config.js      # Vite + Vitest config (single file)
+│   ├── playwright.config.js
 │   ├── .env.example
 │   └── package.json
 └── docs/                   # API.md, ARCHITECTURE.md, SIMULATION_ARCHITECTURE.md,
-                            #   ER_DIAGRAM.md, DEPLOYMENT.md, DEVELOPMENT_LOG.md, SECURITY.md
+                            #   FRONTEND_ARCHITECTURE.md, ER_DIAGRAM.md, DEPLOYMENT.md,
+                            #   DEVELOPMENT_LOG.md, SECURITY.md
 ```
 
 ## Running locally
@@ -166,6 +175,32 @@ see [`frontend/.env.example`](./frontend/.env.example) and
 [`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md) for the two build-time
 variables a production deployment needs instead.
 
+Run the frontend checks - lint, type inference over plain JS, 317 unit and
+integration tests, and a production build - none of which need a database:
+
+```bash
+cd frontend
+npm run verify             # all four, in order
+npm test                   # just the tests (~25s)
+npm run test:coverage      # currently 81% of statements
+```
+
+The end-to-end suite is separate because it is the one layer that needs a
+real stack - the backend, MongoDB, and a real browser - which is also what
+makes it the only layer that can catch a cookie that is never set or a
+handshake CORS rejects. Playwright starts the Vite server itself:
+
+```bash
+cd frontend
+npm run test:e2e:install   # once - downloads Chromium
+npm run test:e2e           # 17 specs against http://localhost:5173
+```
+
+Point `E2E_BASE_URL` at a staging deployment to run the same specs there;
+each one registers its own account and cleans up after itself.
+See [`docs/FRONTEND_ARCHITECTURE.md`](./docs/FRONTEND_ARCHITECTURE.md#6-testing)
+for what each layer is responsible for.
+
 ### 3. Verify the connection
 
 Open http://localhost:5173 — the status pill in the top-right of the nav
@@ -210,3 +245,12 @@ CSRF protection all landed in the security phase.
 including the threat model and what remains out of scope - notably no
 email verification, no password reset, no MFA, and no sharing between
 accounts.
+
+The frontend is no longer the untested half: 317 Vitest unit and
+integration tests and 17 Playwright end-to-end specs now cover the state
+reducer, the connection lifecycle, every panel, and the full operator
+journey through a real browser. What they still cannot check is what gets
+drawn on the canvas - jsdom has no 2D context - so rendering regressions
+are caught by looking.
+[`docs/FRONTEND_ARCHITECTURE.md`](./docs/FRONTEND_ARCHITECTURE.md)
+covers the client's state ownership rules and the limits of each layer.

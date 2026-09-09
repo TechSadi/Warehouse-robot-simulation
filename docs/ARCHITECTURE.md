@@ -170,27 +170,18 @@ Documented here rather than silently left for someone to discover:
   require touching `robot.controller.js`'s `create` handler in a way
   that risked hanging the existing test suite (see that milestone's entry
   in the development log for the full reasoning).
-- **No cascading deletes.** Deleting a `Warehouse` leaves its robots,
-  orders, statistics, and logs in place. For a demo project this is
-  arguably a feature (nothing you generated disappears by accident), but
-  it does mean orphaned documents accumulate if you delete warehouses
-  during testing.
-- **No cascading deletes across the ownership boundary either.** Deleting
-  a warehouse leaves its robots and orders in place; they become
-  unreachable through the API (ownership resolves through the warehouse,
-  which is gone) rather than being removed. See
-  [Security notes](#security-notes) below.
 - **`Robot.taskQueue` in the schema isn't the live source of truth.** The
   Robot Engine keeps its own in-memory task queue of plain
   `{x, y}` destinations during simulation; the schema field is reserved,
   not currently written by the running simulation. See the field's own
   comment in `Robot.js`.
-- **Frontend has no automated test suite.** Every frontend milestone was
-  verified by a clean production build - not by unit or integration
-  tests. The backend (434 tests, 165 of them security tests) carries
-  essentially all of this project's automated test coverage. The auth
-  gate, the CSRF header the API client attaches, and the socket
-  reconnect-on-sign-in are therefore covered only on the server side.
+- **Canvas rendering is not covered by any automated test.** The frontend
+  now has 317 Vitest tests and 17 Playwright end-to-end specs (see
+  [`FRONTEND_ARCHITECTURE.md`](./FRONTEND_ARCHITECTURE.md#6-testing)), but
+  jsdom has no 2D context and Playwright can only assert that the canvas
+  element exists - not what was drawn on it. `GridCanvas.jsx` therefore
+  sits at ~45% coverage and rendering regressions are still caught by
+  looking, not by CI.
 
 ## Security notes
 

@@ -82,3 +82,25 @@
   font-size: 11px;
   color: var(--text-muted);
 }
+
+/* The list is a <dl> now (key -> what it does is literally a definition
+   list); reset the margins the browser adds so the layout is unchanged. */
+.shortcuts-help__list {
+  margin: 0;
+}
+
+.shortcuts-help__desc {
+  margin: 0;
+}
+
+@media (max-width: 600px) {
+  .shortcuts-help__row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .shortcuts-help__desc {
+    text-align: left;
+  }
+}

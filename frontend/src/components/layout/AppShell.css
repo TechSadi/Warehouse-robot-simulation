@@ -12,7 +12,7 @@
 }
 
 .app-shell__rail {
-  width: 300px;
+  width: 320px;
   flex-shrink: 0;
   padding: var(--gap) var(--gap) var(--gap) 0;
   display: flex;
@@ -21,7 +21,14 @@
   overflow-y: auto;
 }
 
-@media (max-width: 960px) {
+/* --- Tablet / narrow desktop ------------------------------------------------
+   Below this the three-column layout (tools | grid | controls) stops fitting
+   without squeezing the grid into uselessness, so it stacks: grid first (it
+   is what the page is for), then the controls that drive it, then the tool
+   palette. The grid keeps a fixed minimum height rather than collapsing -
+   this visualisation is desktop-first by design, and a 120px-tall warehouse
+   would be worse than one you have to scroll to. */
+@media (max-width: 1100px) {
   .app-shell__body {
     flex-direction: column;
     overflow-y: auto;
@@ -36,15 +43,42 @@
     order: 3;
     border-right: none;
     border-top: 1px solid var(--line);
+    overflow: visible;
   }
 
   .sim-canvas {
     order: 1;
-    min-height: 320px;
+    min-height: 420px;
   }
 
   .app-shell__rail {
     order: 2;
     padding: var(--gap);
+    overflow: visible;
+  }
+}
+
+/* Two panel columns on a tablet-width screen, so the rail is not one very
+   long single-file scroll. */
+@media (min-width: 700px) and (max-width: 1100px) {
+  .app-shell__rail {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: start;
+  }
+}
+
+@media (max-width: 700px) {
+  .sim-canvas {
+    min-height: 320px;
+  }
+
+  .app-shell__rail {
+    padding: 12px;
+    gap: 12px;
+  }
+
+  .sidebar {
+    padding: 16px 12px;
   }
 }

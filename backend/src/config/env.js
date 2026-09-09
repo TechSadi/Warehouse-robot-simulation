@@ -89,6 +89,21 @@ const env = {
     lockoutSeconds: Number(process.env.LOGIN_LOCKOUT_SECONDS) || 15 * 60,
   },
 
+  // --- Rate limiting ----------------------------------------------------
+  // Only the registration ceiling is configurable, and only outside
+  // production. A browser-driven E2E suite registers real accounts through
+  // the real form and needs more than the production allowance of five per
+  // hour; every other limit is generous enough that no test has to touch
+  // it. Ignoring the override in production is deliberate - this limit is
+  // what stops the endpoint being used to enumerate which email addresses
+  // have accounts, and an env var is exactly how that protection would get
+  // turned off by accident.
+  rateLimits: {
+    registrationsPerHour: isProduction
+      ? 5
+      : Number(process.env.REGISTER_RATE_LIMIT_MAX) || 5,
+  },
+
   cookies: {
     // Vercel (frontend) and Render (backend) are different registrable
     // domains, so the auth cookies are cross-site in production and must
