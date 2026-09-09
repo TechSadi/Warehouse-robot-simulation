@@ -145,6 +145,21 @@ exist there (see [`ARCHITECTURE.md`](./ARCHITECTURE.md) for why local dev
 doesn't need this: Vite's dev-server proxy handles it implicitly there,
 but a production build has no such proxy).
 
+`VITE_API_URL` now does one more job: the build generates the frontend's
+Content-Security-Policy from it and emits it as a `<meta>` tag in
+`index.html` plus `dist/_headers` (Netlify, Cloudflare Pages) and
+`dist/vercel.json` (Vercel). Getting it wrong therefore no longer only
+breaks the API calls - it produces a policy that *blocks* them, which shows
+up in the browser console as a CSP violation rather than a network error.
+The meta tag works with no hosting configuration at all, so a deployment
+gets a real policy by default; the header files exist because
+`frame-ancestors` and `X-Frame-Options` cannot be set from a meta tag. See
+[`scripts/securityHeaders.js`](../frontend/scripts/securityHeaders.js).
+
+On **Vercel**, point the project's output directory at `frontend/dist` so
+the generated `vercel.json` is picked up. On **Netlify**, `_headers` is
+found automatically in the publish directory.
+
 ### Verify the frontend
 
 Open the deployed frontend URL. The connection-status pill in the top bar
@@ -153,9 +168,27 @@ browser console and check for a CORS error (mismatched `CLIENT_ORIGINS`
 on the backend) or a failed request to the wrong origin (missing/wrong
 `VITE_API_URL`).
 
+### Optional backend environment variables worth setting
+
+None of these throw on startup, and each silently disables something if
+left unset:
+
+| Variable | Without it |
+|---|---|
+| `MAIL_TRANSPORT` + `MAIL_WEBHOOK_URL` | Password reset and email verification generate tokens that are never delivered. Production defaults to `none` deliberately - a reset link written to a log nobody reads is not a delivered email |
+| `APP_BASE_URL` | Emailed links point at the first `CLIENT_ORIGINS` entry, which is usually right |
+| `RATE_LIMIT_STORE` | Defaults to `mongo` in production, which is what you want as soon as there is more than one instance |
+| `SIMULATION_LEASES` | On by default. Leave it on unless you are certain the deployment is single-instance |
+
+The full list, with the reasoning for each default, is in
+[`backend/.env.example`](../backend/.env.example) and
+[`SECURITY.md`](./SECURITY.md#9-environment-secrets).
+
 ## Post-deploy checklist
 
-- [ ] `GET /api/health` on the backend returns `database: "connected"`
+- [ ] `GET /api/health` on the backend returns `{ "status": "ok" }` (it
+      deliberately reports nothing else without a session; sign in and use
+      `GET /api/health/details` to check the database connection)
 - [ ] The frontend loads and shows "Connected" in the top bar
 - [ ] Creating a grid layout and clicking "Sync Layout to Server" succeeds
 - [ ] Spawning a robot and clicking "Start Simulation" shows it moving in
@@ -163,6 +196,11 @@ on the backend) or a failed request to the wrong origin (missing/wrong
 - [ ] Opening the app in a second browser tab shows the *same* simulation
       state (proves the server-owned tick loop and Socket.IO rooms are
       working across clients, not just within one tab)
+- [ ] The browser console shows no Content-Security-Policy violations - if
+      it does, `VITE_API_URL` did not match the backend origin at build
+      time
+- [ ] "Forgot password" produces a delivered email (or, with
+      `MAIL_TRANSPORT=console`, a link in the backend log)
 
 ## A note on free-tier hosting and the tick loop
 
@@ -175,3 +213,15 @@ automatically once the backend wakes back up (see the reconnect handling
 in `useLiveSimulation.js`), but there will be a visible gap. This is a
 free-tier hosting characteristic, not a bug in the app; a paid/always-on
 tier doesn't have this issue.
+
+Two things soften it. A robot's destinations are persisted, so the fleet
+comes back on the work it was doing rather than idle with its orders
+requeued. And a tick advances by *measured* elapsed time rather than by its
+nominal cadence, capped at `MAX_TICK_DELTA_SECONDS` - so the first tick
+after a wake-up catches up a little instead of pretending no time passed,
+without the fleet teleporting across the warehouse. How much time was
+dropped past the cap is reported as `laggedSeconds` in `simulation:status`.
+
+"Keep running when nobody is watching" (`background: true`) does **not**
+help here: it stops the loop being shut down when the last client leaves,
+and has nothing to say about the process being stopped underneath it.

@@ -3,7 +3,7 @@ const { body, param, query } = require('express-validator');
 const controller = require('../controllers/warehouse.controller');
 const validate = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
-const { requireWarehouseParam } = require('../middleware/authorize');
+const { requireWarehouseParam, ACCESS } = require('../middleware/authorize');
 const {
   writeLimiter,
   pathfindingLimiter,
@@ -13,15 +13,28 @@ const {
   tickLimiter,
 } = require('../middleware/rateLimit');
 const { CELL_TYPES } = require('../models/Warehouse');
+const { EMAIL_PATTERN } = require('../models/User');
 const { STRATEGY_KEYS } = require('../engine/scheduling/strategies');
 const { OBSTACLE_TYPES } = require('../engine/obstacles/dynamicObstacles');
 
 const router = Router();
 
 // Every warehouse route requires a signed-in caller, and every route with
-// an `:id` additionally requires that caller to *own* that warehouse
-// (requireWarehouseParam). Authentication alone would still let any signed-
-// in user read and drive every other user's simulation by guessing ids.
+// an `:id` additionally requires that caller to *reach* that warehouse far
+// enough for what they are asking (requireWarehouseParam). Authentication
+// alone would still let any signed-in user read and drive every other
+// user's simulation by guessing ids.
+//
+// The level is named at each route rather than inferred from the HTTP
+// verb, because the verb is the wrong signal here: `POST /:id/tick` is a
+// write in every sense that matters, and `PUT /:id` (which can change the
+// layout, reloading the engine and requeueing in-flight orders) is a
+// different kind of act from `POST /:id/orders/generate`. Three levels,
+// defined in middleware/authorize.js:
+//
+//   VIEW  read it, watch it run
+//   EDIT  change what is in it - robots, orders, obstacles, ticking
+//   OWN   change whether it exists, what shape it is, and who can reach it
 router.use(requireAuth);
 
 const idParam = param('id').isMongoId().withMessage('id must be a valid Mongo ObjectId');
@@ -49,7 +62,7 @@ router.get(
   controller.list
 );
 
-router.get('/:id', [idParam], validate, requireWarehouseParam(), controller.getOne);
+router.get('/:id', [idParam], validate, requireWarehouseParam('id', { access: ACCESS.VIEW }), controller.getOne);
 
 router.post(
   '/',
@@ -89,13 +102,24 @@ router.put(
       .withMessage(`schedulingStrategy must be one of: ${STRATEGY_KEYS.join(', ')}`),
   ],
   validate,
-  requireWarehouseParam(),
+  // OWN: this route can change `rows`/`cols`/`cells`, which invalidates
+  // the live engine and requeues every in-flight order. Reshaping the
+  // building is not something a collaborator does to it.
+  requireWarehouseParam('id', { access: ACCESS.OWN }),
   controller.update
 );
 
-router.delete('/:id', [idParam], validate, requireWarehouseParam(), controller.remove);
+router.delete('/:id', [idParam], validate, requireWarehouseParam('id', { access: ACCESS.OWN }), controller.remove);
 
-router.patch('/:id/activate', [idParam], validate, requireWarehouseParam(), controller.activate);
+// Activation deactivates the caller's *other* warehouses, so it is a
+// statement about their own account rather than about this warehouse.
+router.patch(
+  '/:id/activate',
+  [idParam],
+  validate,
+  requireWarehouseParam('id', { access: ACCESS.OWN }),
+  controller.activate
+);
 
 router.post(
   '/:id/path',
@@ -114,7 +138,7 @@ router.post(
     body('trace').optional().isBoolean().withMessage('trace must be true or false'),
   ],
   validate,
-  requireWarehouseParam(),
+  requireWarehouseParam('id', { access: ACCESS.VIEW }),
   controller.findRoute
 );
 
@@ -145,7 +169,13 @@ router.post(
   controller.dispatchOrders
 );
 
-router.get('/:id/obstacles', [idParam], validate, requireWarehouseParam(), controller.listObstacles);
+router.get(
+  '/:id/obstacles',
+  [idParam],
+  validate,
+  requireWarehouseParam('id', { access: ACCESS.VIEW }),
+  controller.listObstacles
+);
 
 router.post(
   '/:id/obstacles',
@@ -172,6 +202,44 @@ router.delete(
   validate,
   requireWarehouseParam(),
   controller.removeObstacle
+);
+
+// --- Sharing -----------------------------------------------------------
+//
+// All three require OWN. An editor can change everything *in* a warehouse
+// and nothing about who can reach it - otherwise the first person you
+// shared with could share it onward, or remove you.
+
+router.get(
+  '/:id/collaborators',
+  [idParam],
+  validate,
+  requireWarehouseParam('id', { access: ACCESS.OWN }),
+  controller.listCollaborators
+);
+
+router.post(
+  '/:id/collaborators',
+  writeLimiter,
+  [
+    idParam,
+    // By email, not by user id: an id is not something one person knows
+    // about another, and an endpoint that resolved one would be an
+    // enumeration oracle over the user table.
+    body('email').isString().trim().toLowerCase().isLength({ max: 254 }).matches(EMAIL_PATTERN),
+    body('role').optional().isIn(['viewer', 'editor']),
+  ],
+  validate,
+  requireWarehouseParam('id', { access: ACCESS.OWN }),
+  controller.addCollaborator
+);
+
+router.delete(
+  '/:id/collaborators/:userId',
+  [idParam, param('userId').isMongoId()],
+  validate,
+  requireWarehouseParam('id', { access: ACCESS.OWN }),
+  controller.removeCollaborator
 );
 
 module.exports = router;

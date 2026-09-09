@@ -119,7 +119,15 @@ async function dispatchPendingOrdersLocked(warehouseId) {
         // from the UI, or assigned by a concurrent dispatch), the filter
         // matches nothing instead of overwriting a later state.
         filter: { _id: orderId, status: { $in: predecessorsOf('assigned') } },
-        update: { status: 'assigned', assignedRobot: robotId, assignedAt: new Date() },
+        update: {
+          status: 'assigned',
+          assignedRobot: robotId,
+          // Captured here, while the robot certainly exists, so the
+          // finished order can still say who carried it after the robot
+          // is gone - see the field's comment in models/Order.js.
+          assignedRobotName: snapshot?.name || null,
+          assignedAt: new Date(),
+        },
       },
     });
   }
@@ -291,9 +299,23 @@ async function releaseOrders(warehouseId, orderIds, { restoreToPending = true } 
   return ids;
 }
 
-/** Releases every order a given robot is working - both the coordinator's
- * runtime assignment and any order document still pointing at it. Called
- * when a robot is deleted while a simulation is running. */
+/**
+ * Unwinds every reference a deleted robot leaves behind on the order side.
+ *
+ * Two different kinds of reference, handled differently:
+ *
+ *  - **In-flight orders** are work that still needs doing. Both the
+ *    coordinator's runtime assignment and the document's pointer are
+ *    dropped, and the order returns to `pending` for a healthy robot.
+ *
+ *  - **Finished orders** (delivered, cancelled) are history, and history is
+ *    not rewritten - but a pointer to a document that no longer exists is
+ *    not history, it is a dangling reference: it populates to null, and a
+ *    completed order that cannot say who delivered it has lost the very
+ *    thing it was recording. The pointer is cleared and
+ *    `assignedRobotName`, captured at assignment time, is what carries the
+ *    fact forward.
+ */
 async function releaseOrdersForRobot(warehouseId, robotId, releasedOrderIds = []) {
   const stranded = await Order.find({
     warehouseId,
@@ -303,7 +325,18 @@ async function releaseOrdersForRobot(warehouseId, robotId, releasedOrderIds = []
 
   const ids = new Set(releasedOrderIds.map(String));
   for (const doc of stranded) ids.add(String(doc._id));
-  return releaseOrders(warehouseId, [...ids]);
+  const released = await releaseOrders(warehouseId, [...ids]);
+
+  // Everything else this robot is still named on has already finished.
+  // `$ne` over IN_FLIGHT_STATUSES rather than an explicit terminal list, so
+  // a status added to the lifecycle later is covered by default instead of
+  // being quietly skipped here.
+  await Order.updateMany(
+    { warehouseId, assignedRobot: robotId, status: { $nin: IN_FLIGHT_STATUSES } },
+    { $set: { assignedRobot: null } }
+  );
+
+  return released;
 }
 
 module.exports = {

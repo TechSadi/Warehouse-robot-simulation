@@ -11,6 +11,7 @@ import {
 } from '../api/client.js';
 import { describeError } from '../api/errors.js';
 import { realtime } from '../api/realtime.js';
+import { setTelemetryWarehouse } from '../api/telemetry.js';
 import { useRealtimeStatus, isLive } from './useConnection.js';
 import {
   simulationReducer,
@@ -139,6 +140,11 @@ export function useLiveSimulation(warehouseId, grid) {
     setActionError(null);
     heatmapRef.current = new Map();
     setHeatmapEpoch((epoch) => epoch + 1);
+
+    // So a client error report lands in the log of the warehouse the
+    // operator was actually watching when it happened - see
+    // api/telemetry.js. Cleared below when there is no warehouse.
+    setTelemetryWarehouse(warehouseId);
 
     if (!warehouseId) {
       setPhase(SIMULATION_PHASE.IDLE);
@@ -332,13 +338,28 @@ export function useLiveSimulation(warehouseId, grid) {
     return false;
   }, []);
 
-  const startSimulation = useCallback(() => {
-    if (!warehouseId || !requireLive()) return;
-    setActionError(null);
-    // Optimistic; `simulation:status` confirms or corrects it within a tick.
-    dispatch({ type: 'simulation/optimistic', running: true });
-    realtime.emit('simulation:start', { warehouseId, deltaSeconds: TICK_DELTA_SECONDS });
-  }, [warehouseId, requireLive]);
+  /**
+   * @param {{background?: boolean}} [options] `background: true` asks the
+   *   server to keep the simulation running once the last watcher leaves.
+   *   Off by default, because the default reading of "start" is "start,
+   *   while I watch" - and a run nobody is watching still costs a tick
+   *   loop, a pinned engine and a stream of writes. The server bounds how
+   *   long an unattended run may last (MAX_BACKGROUND_SECONDS).
+   */
+  const startSimulation = useCallback(
+    (options = {}) => {
+      if (!warehouseId || !requireLive()) return;
+      setActionError(null);
+      // Optimistic; `simulation:status` confirms or corrects it within a tick.
+      dispatch({ type: 'simulation/optimistic', running: true });
+      realtime.emit('simulation:start', {
+        warehouseId,
+        deltaSeconds: TICK_DELTA_SECONDS,
+        background: Boolean(options.background),
+      });
+    },
+    [warehouseId, requireLive]
+  );
 
   const stopSimulation = useCallback(() => {
     if (!warehouseId || !requireLive()) return;

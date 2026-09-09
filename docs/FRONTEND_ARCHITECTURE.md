@@ -177,8 +177,8 @@ Three layers, each catching what the layer below structurally cannot.
 
 | Layer | Runner | Count | What only it can see |
 |---|---|---|---|
-| Unit | Vitest + jsdom | 317 across 16 files | Reducer transitions, the connection state machine, formatting, the grid engine - no React tree or server needed |
-| Integration | Vitest + Testing Library | 21 of those 317 (`tests/integration`) | The seams *between* hooks, panels and the transport, with only `fetch` and the socket replaced |
+| Unit | Vitest + jsdom | 395 across 19 files | Reducer transitions, the connection state machine, formatting, the grid engine, the canvas scene, the generated CSP - no React tree or server needed |
+| Integration | Vitest + Testing Library | 21 of those 395 (`tests/integration`) | The seams *between* hooks, panels and the transport, with only `fetch` and the socket replaced |
 | End-to-end | Playwright + Chromium | 17 across 2 specs | A cookie never actually set, a CORS policy blocking the handshake, a CSRF header the server rejects - all invisible in jsdom, where the network is a mock |
 
 The bugs this phase fixed - a socket that never recovered from an expired
@@ -188,11 +188,17 @@ everything mocked sees nothing. That is why the integration layer mocks
 only the two transports and runs the real auth provider, connection
 manager, state hooks and every panel.
 
-Coverage is **81.2% of statements, 82.8% of lines** (`npm run
-test:coverage`). The gap is concentrated and deliberate: `GridCanvas.jsx`
-sits at 45% because jsdom has no 2D context, so every drawing call is a
-no-op and asserting on it would measure nothing. `main.jsx` and the theme
-tokens are excluded for the same reason.
+Coverage is **87.9% of statements, 89.9% of lines** (`npm run
+test:coverage`), up from 81.2% once the canvas stopped being unreachable.
+
+The remaining gap is concentrated in `GridCanvas.jsx` (~51%), and it is
+now a different gap from the one it used to be. What is still uncovered
+there is *pointer and keyboard interaction* - drag-to-pan, wheel zoom,
+click-to-paint - which needs real geometry and real events that jsdom does
+not produce; those are exercised end to end in Playwright instead. What
+used to be uncovered was the drawing itself, and that moved to
+`renderScene.js`, which sits at 100%. `main.jsx` and the theme tokens stay
+excluded: one is an entry point and the other is a table of constants.
 
 `npm test` must stay runnable on a laptop with no database, so the e2e
 suite is a separate `npm run test:e2e`. It drives a real browser against a
@@ -219,17 +225,47 @@ on a hang, but not a stopwatch on how busy the host is.
 
 ## 7. Known limitations
 
-- **Canvas rendering is not verified by any automated test.** jsdom cannot
-  give it a context, and Playwright can only assert the canvas exists, not
-  what was drawn. Rendering regressions are caught by looking.
-- **No telemetry.** `ErrorBoundary` logs to the console. A render error in
-  a deployed build is invisible unless a user reports it.
-- **Offline means read-only, not queued.** Commands issued while
-  disconnected are refused with a message rather than buffered and
-  replayed. Replaying stale commands against a simulation that has moved on
-  is worse than declining them.
-- **One warehouse at a time.** The live view joins a single room; watching
-  two simultaneously is not a supported layout.
+Two of these are constraints. Two are decisions, and are listed here
+because a reader deserves to know they were made on purpose rather than
+overlooked - which is not the same thing as a gap.
+
+### Constraints
+
+- **Rendering is verified above the pixels, not at them.** The drawing
+  logic is now pure functions of a scene object
+  ([`renderScene.js`](../frontend/src/components/simulation/renderScene.js)),
+  and a recording stand-in for the 2D context
+  ([`tests/helpers/recordingContext.js`](../frontend/tests/helpers/recordingContext.js))
+  checks the decisions: viewport culling, layer order, robot status
+  colours, the battery ring's sweep, heatmap normalisation, and that every
+  colour drawn comes from `theme.js`. What no test here can check is
+  whether those calls produce the right *image* - that is screenshot
+  diffing, it needs a real browser and a baseline, and it is the honest
+  residue of the old "caught by looking" note.
+- **Telemetry is one log line, not an observability stack.** A render
+  error posts to this project's own API and becomes a `Log` entry the user
+  can read in the Logs panel ([`telemetry.js`](../frontend/src/api/telemetry.js)).
+  Nothing leaves the deployment, there is no session replay, no breadcrumb
+  trail, no aggregation across users. The reporter deduplicates and caps
+  itself, so a component failing on every tick reports once rather than
+  twice a second - which also means a *recurring* failure looks identical
+  to a single one in the log.
+
+### Decisions
+
+- **Offline is read-only, not queued.** Commands issued while disconnected
+  are refused with a message rather than buffered and replayed. This is
+  not a missing feature: a queued "start simulation" that fires four
+  minutes later, against a warehouse whose layout has since changed and
+  whose orders have been redispatched, is worse than a refusal the
+  operator saw at the time. The state the commands would act on is
+  server-owned and moves on without us.
+- **One warehouse at a time.** The live view joins a single room. Watching
+  two simultaneously would mean two socket rooms, two reducers, two
+  heatmaps and a canvas that has to say which fleet is which - a different
+  product, not a bigger version of this one. The constraint is in the
+  layout, not in the transport: nothing in `realtime.js` or the reducer
+  assumes it.
 
 ---
 
@@ -237,7 +273,7 @@ on a hang, but not a stopwatch on how busy the host is.
 
 ```bash
 cd frontend
-npm run verify        # lint, typecheck, 317 unit/integration tests, production build
+npm run verify        # lint, typecheck, 395 unit/integration tests, production build
 npm run test:coverage # the coverage figures quoted above
 
 # e2e needs the backend and MongoDB running; Playwright starts Vite itself

@@ -4,9 +4,17 @@ const mongoose = require('mongoose');
 // can drift into accepting a state the other rejects.
 const { STATUSES } = require('../domain/robotLifecycle');
 
-// Movement/task-queue behavior lands in Milestone 5 (Robot Engine); this
-// schema just needs to hold the fields that milestone will read and write,
-// so the two milestones don't have to renegotiate the data model later.
+/** A destination cell. The engine plans between whole cells, so a queued
+ * task is always integral even though a robot's *position* is not while it
+ * is part-way between two of them. */
+const destinationSchema = new mongoose.Schema(
+  {
+    x: { type: Number, required: true, min: 0 },
+    y: { type: Number, required: true, min: 0 },
+  },
+  { _id: false }
+);
+
 const robotSchema = new mongoose.Schema(
   {
     name: {
@@ -30,11 +38,34 @@ const robotSchema = new mongoose.Schema(
     battery: { type: Number, default: 100, min: 0, max: 100 },
     status: { type: String, enum: STATUSES, default: 'idle' },
     errorReason: { type: String, default: null },
-    // Reserved for Order Management (Milestone 6) to assign real orders.
-    // The Robot Engine's own task queue (Milestone 5) works in terms of
-    // plain {x, y} destinations kept in memory during simulation, and
-    // isn't persisted here - see backend/src/engine/robots/robotEngine.js.
-    taskQueue: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Order' }],
+
+    /**
+     * The destination this robot is currently driving to, and the ones
+     * queued behind it.
+     *
+     * These used to be reserved-but-unwritten: the schema declared a
+     * `taskQueue` of Order references that the running simulation never
+     * touched, while the engine kept the real queue of `{x, y}`
+     * destinations in memory only. Two things followed from that. The
+     * schema described a data model the application did not have - the
+     * field was documentation of an intention, not of a fact. And every
+     * restart, layout edit or engine-cache eviction silently threw the
+     * fleet's work away: robots came back idle with empty queues, and the
+     * orders driving those destinations had to be released back to
+     * `pending` and re-dispatched from scratch.
+     *
+     * They are now written from the engine snapshot on every persist, and
+     * read back when an engine is built (services/simulationManager.js),
+     * so a robot resumes the route it was driving. What is deliberately
+     * *not* persisted is the computed A* path: the world may have changed
+     * while the process was down, so the destination is replayed and the
+     * path is planned fresh against the grid as it is now.
+     *
+     * They stay simulation-owned - the REST API cannot write them (see
+     * domain/robotLifecycle.js and controllers/robot.controller.js).
+     */
+    currentTask: { type: destinationSchema, default: null },
+    taskQueue: { type: [destinationSchema], default: [] },
   },
   {
     timestamps: true,

@@ -52,21 +52,57 @@ function authed(req, user = makeUser()) {
   return req.set('Authorization', `Bearer ${tokenFor(user)}`);
 }
 
-/** A warehouse document as the ownership middleware expects to find it. */
+/**
+ * A warehouse document as the authorization middleware expects to find it.
+ *
+ * `toObject` is here because the controllers spread the document to append
+ * the caller's access level to the response, and a Mongoose document is
+ * not a plain object. Pass `collaborators` to exercise a shared warehouse.
+ */
 function makeWarehouse(id = WAREHOUSE_A_ID, ownerId = USER_A_ID, overrides = {}) {
-  return { _id: id, ownerId, name: 'Test Warehouse', rows: 20, cols: 20, cells: [], ...overrides };
+  const doc = {
+    _id: id,
+    ownerId,
+    name: 'Test Warehouse',
+    rows: 20,
+    cols: 20,
+    cells: [],
+    collaborators: [],
+    dynamicObstacles: [],
+    ...overrides,
+  };
+  doc.toObject = () => ({ ...doc, toObject: undefined });
+  return doc;
 }
 
 /**
- * Wires the mocked Warehouse model so `findOwnedWarehouse` resolves for
- * the given owner and 404s for anyone else - the single query every
- * ownership check in middleware/authorize.js funnels through.
+ * Wires the mocked Warehouse model so the authorization middleware
+ * resolves for the given owner (and for anyone the warehouse is shared
+ * with) and 404s for everyone else - the single query every access check
+ * in middleware/authorize.js funnels through.
+ *
+ * The filter now takes two shapes, and this understands both:
+ * `{ _id, ownerId }` for the ownership-only helper, and
+ * `{ _id, $or: [{ownerId}, {'collaborators.userId'}] }` for the
+ * sharing-aware one. Matching on the shape rather than on a fixed filter
+ * is what lets one helper serve both without every caller knowing which
+ * guard the route under test happens to use.
  */
 function mockOwnership(Warehouse, { warehouse = makeWarehouse(), ownerId = USER_A_ID } = {}) {
   Warehouse.findOne.mockImplementation((filter = {}) => {
     const idMatches = !filter._id || String(filter._id) === String(warehouse._id);
-    const ownerMatches = !filter.ownerId || String(filter.ownerId) === String(ownerId);
-    return Promise.resolve(idMatches && ownerMatches ? warehouse : null);
+    if (!idMatches) return Promise.resolve(null);
+
+    // Which user is asking, whichever shape the filter came in.
+    const asking = filter.ownerId ?? filter.$or?.[0]?.ownerId;
+    if (asking === undefined) return Promise.resolve(warehouse);
+
+    const isOwner = String(asking) === String(ownerId);
+    const sharedWith =
+      Boolean(filter.$or) &&
+      (warehouse.collaborators || []).some((c) => String(c.userId) === String(asking));
+
+    return Promise.resolve(isOwner || sharedWith ? warehouse : null);
   });
   return warehouse;
 }

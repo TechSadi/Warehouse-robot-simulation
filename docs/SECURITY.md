@@ -44,6 +44,30 @@ simulation makes.
 | `POST` | `/api/auth/logout` | Revoke this session |
 | `POST` | `/api/auth/logout-all` | Revoke every session for the user |
 | `GET`  | `/api/auth/me` | The current user |
+| `POST` | `/api/auth/password/forgot` | Start a password reset |
+| `POST` | `/api/auth/password/reset` | Complete one, with the emailed token |
+| `POST` | `/api/auth/password/change` | Change it while signed in |
+| `POST` | `/api/auth/email/verify/request` | Send a confirmation link |
+| `POST` | `/api/auth/email/verify` | Confirm, with the emailed token |
+| `POST` | `/api/auth/mfa/setup` | Generate a TOTP secret and QR URI |
+| `POST` | `/api/auth/mfa/enable` | Confirm enrolment, receive recovery codes |
+| `POST` | `/api/auth/mfa/disable` | Turn it off (password **and** a factor) |
+
+Four of these are unauthenticated by necessity, and each for a specific
+reason worth stating:
+
+- `password/forgot` and `password/reset` — the whole point is that the
+  caller cannot sign in. Both answer identically whether or not the address
+  has an account, because a "we couldn't find that email" would make them a
+  cleaner account-existence oracle than the login form, which goes to real
+  trouble not to be one.
+- `email/verify` — the link is followed from an email client, which is
+  frequently not the browser holding the session. The token is the
+  credential.
+- `refresh` — establishing a session is what it is for.
+
+All four carry the strict `accountRecoveryLimiter` on top of the ordinary
+auth limiter.
 
 `/api/health` and `/api/auth/*` are the only routes reachable without a
 session. Every other router calls `router.use(requireAuth)` at its top, so
@@ -75,10 +99,40 @@ they stop different attacks:
 - Per-IP: 10 failed attempts per 15 minutes on `/api/auth/*`
   (`skipSuccessfulRequests`, so a user is never locked out by their own
   successful logins). Stops one host hammering many accounts.
-- Per-account: 8 consecutive failures locks the account for 15 minutes,
-  and the lock holds even against the correct password — otherwise it
-  would not slow an attacker down at all. Stops a distributed attack
-  concentrating on one account.
+- Per-account **per source network**: 8 consecutive failures from one
+  source locks *that source* out of the account for 15 minutes, and the
+  lock holds even against the correct password — otherwise it would not
+  slow an attacker down at all.
+
+The per-source part is a correction, not a detail. A single account-wide
+counter made lockout a denial-of-service lever: anyone who knew a victim's
+email could keep the account locked indefinitely with a stream of wrong
+passwords, and the victim could not sign in from anywhere. Bucketing by
+source keeps the defence pointed at the attack — the guessing source is
+locked out, and the real user, coming from somewhere else, is unaffected.
+
+The trade is explicit: an attacker with many source addresses now gets more
+attempts against one account than before. What bounds that is the per-IP
+limiter above, which is the control actually suited to a distributed
+attack, and `User.globalFailedLogins`, which counts every failure from
+anywhere so the *pattern* is recorded even though it is not acted on. The
+bucket list is capped (`MAX_LOGIN_FAILURE_BUCKETS`) so rotating addresses
+cannot grow one user document without limit.
+
+**Second factor.** When MFA is enabled, a correct password alone answers
+`401` with `code: MFA_REQUIRED`. That is deliberately *not* the vague
+"invalid email or password": the caller has already proven the password, so
+there is nothing left to enumerate, and being vague would only confuse a
+legitimate user. A TOTP code is refused if its step has already been
+accepted (`MFA_REPLAY`), so a code captured by a phishing page and relayed
+does not work twice.
+
+**Password reset flooding.** `accountRecoveryLimiter` is tighter than the
+auth limiter and on a longer window (10 per hour per IP), because a reset
+request sends mail to an address the caller named — an unlimited one is
+both an enumeration oracle and a way to use this service to spam a third
+party. Each request also supersedes the previous token, so a flood is a
+denial of service against a user genuinely trying to recover an account.
 
 **Credential enumeration.** Login answers `401 "Invalid email or password"`
 whether the account exists or not, and takes comparable time either way:
@@ -127,13 +181,45 @@ User
 ```
 
 Every resource reaches its owner through exactly one warehouse, so "may
-this caller touch this object?" always reduces to "does the caller own the
-warehouse it belongs to?".
+this caller touch this object?" always reduces to "how far does the caller
+reach into the warehouse it belongs to?".
 
 `Warehouse.ownerId` is `immutable` and set from the session, never from the
 request body. Child documents are **not** denormalized with an owner:
-ownership is resolved through the warehouse on every request, so there is
-no second copy to drift out of sync.
+access is resolved through the warehouse on every request, so there is no
+second copy to drift out of sync.
+
+### Three levels, not two
+
+Ownership used to be the whole of the model — one user per warehouse, no
+team, no viewer, no shared simulation — and the workaround that forced was
+"send them your password". Warehouses can now carry `collaborators`, so the
+answer is no longer yes/no:
+
+| Level | May |
+|---|---|
+| `view` | Read everything, and watch the live simulation |
+| `edit` | ...and change what is *in* it: robots, orders, obstacles, ticking, starting and stopping |
+| `own` | ...and change whether it exists, what shape it is, and who else can reach it |
+
+Each level includes the ones below. The level a route needs is **named at
+the route**, not inferred from the HTTP verb, because the verb is the wrong
+signal here: `POST /:id/tick` is a write in every sense that matters, and
+`PUT /:id` — which can change the layout, reloading the engine and
+requeueing in-flight orders — is a different kind of act from
+`POST /:id/orders/generate`.
+
+Three deliberate absences:
+
+- **There is no `owner` role to grant.** The owner is `ownerId`, it is
+  immutable, and no amount of sharing can produce a warehouse with two
+  people who can each remove the other.
+- **A viewer cannot start or stop the simulation.** A viewer is an
+  audience, and a simulation running is a change to what everyone else in
+  the room is watching.
+- **An editor cannot share onward or remove anyone**, including the owner.
+  Otherwise the first person you shared with could lock you out of your own
+  warehouse.
 
 ### Enforcement
 
@@ -143,18 +229,31 @@ controllers is a check that will be forgotten in the thirteenth.
 
 | Helper | Used for |
 |---|---|
-| `requireWarehouseParam()` | routes with a warehouse `:id` |
-| `requireWarehouseBody()` | creates that name a warehouse in the body |
-| `requireOwnedResource(Model, label)` | a child addressed by its own id |
-| `scopeListToOwner()` | collection endpoints |
+| `requireWarehouseParam(param, { access })` | routes with a warehouse `:id` |
+| `requireWarehouseBody(field, { access })` | creates that name a warehouse in the body |
+| `requireOwnedResource(Model, label, { access })` | a child addressed by its own id |
+| `scopeListToOwner({ access })` | collection endpoints |
+| `findAccessibleWarehouse(id, userId, access)` | the Socket.IO layer, which answers in its own vocabulary rather than by throwing |
 
-### 404, not 403
+Every one of them funnels into `loadAccessibleWarehouse`, which runs one
+query — `{ _id, $or: [{ ownerId }, { 'collaborators.userId' }] }` — and
+compares the level it finds against the level the route asked for. One
+query, one comparison, one place to get it wrong.
 
-A resource the caller does not own answers **404**, identical in status and
-wording to one that never existed. A 403 confirms the id is real, which is
-all an attacker sweeping ObjectIds needs to map the deployment. This is
-tested explicitly: `authorization.test.js` asserts the two responses are
-indistinguishable.
+### 404, not 403 — and when 403 *is* right
+
+A resource the caller cannot reach **at all** answers **404**, identical in
+status and wording to one that never existed. A 403 there would confirm the
+id is real, which is all an attacker sweeping ObjectIds needs to map the
+deployment. This is tested explicitly: `authorization.test.js` asserts the
+two responses are indistinguishable.
+
+A caller who *can* reach it but not far enough — a viewer on a shared
+warehouse reaching for something only an editor may do — gets **403**, with
+the level required and the level granted. At that point there is nothing
+left to conceal: they already know the warehouse exists, they can already
+read it, and "you may look but not touch" is genuinely useful to be told
+rather than a leak. Denials of this kind are recorded in the audit trail.
 
 ### Unfiltered lists
 
@@ -341,6 +440,8 @@ clicking around ever would. Limits are therefore per cost class.
 |---|---|---|---|
 | `/api/auth/*` | 15 min | 10 failures | IP |
 | `POST /api/auth/register` | 1 hour | 5 | IP |
+| Password reset / verification / MFA changes | 1 hour | 10 | IP |
+| Client error reports | 1 min | 20 | user |
 | All `/api` (baseline) | 1 min | 600 | user, else IP |
 | Pathfinding | 1 min | 60 | user |
 | A\* **trace** mode | 1 min | 15 | user |
@@ -368,6 +469,26 @@ request, resetting its budget every time.
 (`true`) would let a client set `X-Forwarded-For` itself and choose its own
 rate-limit key.
 
+### Where the counters live
+
+`express-rate-limit`'s default memory store is per process: limits are not
+shared across instances and reset on every restart and redeploy. That was
+accurate-but-fragile on a single free-tier instance and simply wrong the
+moment there are two — an attacker gets one full budget per instance, and
+any deploy hands out fresh budgets to everyone.
+
+`RATE_LIMIT_STORE=mongo`, the production default, keeps them in the
+database this application already has
+(`middleware/rateLimitStore.js`). Mongo rather than Redis because a rate
+limiter is not worth an extra piece of infrastructure to run, monitor and
+pay for; the trade is a round trip per limited request, which Redis would
+not charge. Each limiter gets its own key prefix, so two limiters that both
+key by IP cannot share a counter and silently enforce the tighter of the
+two on both.
+
+The socket buckets remain per connection by design — they bound what one
+socket can push, and a socket is by definition attached to one process.
+
 ---
 
 ## 7. CORS, headers, cookies, CSRF
@@ -387,6 +508,38 @@ rather than falling back to a permissive default.
 Requests with no `Origin` header (curl, health checks) are allowed through
 CORS — there is no browser to protect, and CORS is not an authentication
 mechanism. `requireAuth` still applies.
+
+### The frontend's own headers
+
+The API's CSP governs the API, which serves no HTML — so until recently the
+policy that actually governs *the dashboard* did not exist anywhere. That
+was recorded as a hosting-configuration change outside the codebase, which
+was true of the header and not of the policy: `connect-src` has to name
+whichever API origin a given build was pointed at, and only the build knows
+that.
+
+`frontend/scripts/securityHeaders.js` generates it from `VITE_API_URL` at
+build time and emits it three ways, because the deployment targets disagree
+about how to be configured:
+
+| Output | Read by | Carries |
+|---|---|---|
+| `<meta http-equiv>` in `index.html` | any static host, no configuration | everything except the header-only directives |
+| `dist/_headers` | Netlify, Cloudflare Pages | the full set |
+| `dist/vercel.json` | Vercel | the full set |
+
+The meta tag is what makes the policy real *by default* rather than by
+someone remembering to wire something up; the header files exist because
+`frame-ancestors`, `report-uri` and `sandbox` are header-only by
+specification. Clickjacking protection therefore comes from
+`X-Frame-Options: DENY` as well.
+
+The policy allows no inline or evaluated script — nothing in the app
+evaluates strings as code, and leaving both out makes a whole class of
+injection unexploitable rather than merely difficult. `'unsafe-inline'` is
+granted for **styles only**, which Vite and recharts both require; style
+injection is defacement rather than code execution, so it is a materially
+smaller concession than the script equivalent, which is not made.
 
 ### Headers
 
@@ -476,9 +629,20 @@ than correctness:
 | `JWT_ACCESS_TTL_SECONDS` | no | Default 900 |
 | `JWT_REFRESH_TTL_SECONDS` | no | Default 2592000 |
 | `BCRYPT_ROUNDS` | no | Default 12 |
-| `MAX_FAILED_LOGINS` | no | Default 8 |
+| `MAX_FAILED_LOGINS` | no | Default 8, counted per source network |
 | `LOGIN_LOCKOUT_SECONDS` | no | Default 900 |
+| `MAX_LOGIN_FAILURE_BUCKETS` | no | Default 20 — bounds the per-source list on one account |
 | `COOKIE_SAMESITE` / `COOKIE_SECURE` / `COOKIE_DOMAIN` | no | Derived from `NODE_ENV` |
+| `RATE_LIMIT_STORE` | no | `mongo` in production, `memory` elsewhere |
+| `MAIL_TRANSPORT` | **production, in practice** | `console` / `webhook` / `none`. Defaults to `none` in production, so reset and verification links go nowhere until this is set deliberately |
+| `MAIL_WEBHOOK_URL` / `MAIL_WEBHOOK_TOKEN` | with `webhook` | Where outbound mail is POSTed |
+| `APP_BASE_URL` | no | Where emailed links point; defaults to the first `CLIENT_ORIGINS` entry |
+| `PASSWORD_RESET_TTL_SECONDS` | no | Default 1800 — a reset token is a live credential |
+| `EMAIL_VERIFICATION_TTL_SECONDS` | no | Default 86400 — a verification token is not |
+| `REQUIRE_EMAIL_VERIFICATION` | no | Default `false`; turning it on without a working transport locks everyone out |
+| `TOTP_WINDOW` | no | Default 1 step (±30s) of clock drift |
+| `MFA_RECOVERY_CODE_COUNT` | no | Default 10 |
+| `SIMULATION_LEASES` | no | On outside tests — one instance owns a warehouse's tick loop |
 
 Generate each secret separately — they must not be the same value:
 
@@ -498,7 +662,9 @@ response to a suspected leak.
 
 No secret reaches the frontend. Every `VITE_*` value is baked into the
 public bundle in plain text; the session lives in cookies the browser
-manages, and the app never sees a token.
+manages, and the app never sees a token. `VITE_API_URL` is the one
+`VITE_*` value that matters to security, and only because the generated CSP
+is built from it — it is a public origin, not a secret.
 
 ---
 
@@ -524,69 +690,95 @@ manages, and the app never sees a token.
 | Cross-origin credential abuse | Strict CORS allow-list, no wildcard with credentials |
 | Resource exhaustion | Tiered rate limits, payload/body caps, bounded `deltaSeconds` |
 | Information disclosure via errors | Generic 500s and 401s in production, no stack traces, truncated 404 paths |
-| Audit-trail forgery | `Log.source` server-assigned |
+| Audit-trail forgery | `Log.source` server-assigned; `SecurityEvent` is server-authored and has no write route at all |
+| Password-reset token theft or replay | Single-use via an atomic consume, short-lived, superseded on reissue, bound to the address it was issued for, and completing one revokes every session |
+| Stolen second factor | TOTP codes are refused for a step already accepted, so a shoulder-surfed or relayed code cannot be used twice |
+| A collaborator escalating on a shared warehouse | Sharing, reshaping and deleting all require ownership; an editor can change what is *in* a warehouse and never who can reach it |
 
 ### Out of scope
 
-- **Email verification** — anyone can register with an address they do not
-  control. There is no email infrastructure in this project.
-- **Password reset** — no reset flow exists; a forgotten password means a
-  new account. Adding one introduces its own token-handling surface.
-- **MFA.**
-- **Sharing / collaboration** — ownership is strictly one user per
-  warehouse. There is no concept of a team, a viewer, or a shared
-  simulation.
-- **Admin tooling** — the `admin` role exists on the model and
-  `requireRole` is implemented, but no route uses it. Authorization here is
-  ownership-based by design.
-- **Audit logging of security events** — failed logins and authorization
-  denials are not persisted for review.
 - **Infrastructure** — TLS termination, WAF, DDoS protection, and database
   network rules belong to Render/Vercel/Atlas, not to this code.
+- **Federated identity** — no OAuth, no SSO, no directory integration. One
+  password and one optional second factor per account.
+- **Session-level device management** — a user can end *all* sessions, and
+  an admin can end another user's, but there is no per-device list to
+  revoke one from.
+- **Data export / erasure workflows** — deleting a warehouse cascades to
+  its contents, and deleting an account is not implemented.
+
+Six things that used to be on this list are not any more:
+
+| Was out of scope | Now |
+|---|---|
+| Email verification | `POST /auth/email/verify/request` and `/auth/email/verify`, with single-use expiring tokens. Enforcement is opt-in (`REQUIRE_EMAIL_VERIFICATION`) so turning it on without a mail transport cannot lock everyone out |
+| Password reset | `POST /auth/password/forgot` and `/auth/password/reset`. Delivery is a transport seam (`services/mailer.js`), which is the part that was genuinely missing; the token handling is the part that mattered |
+| MFA | RFC 6238 TOTP on `node:crypto`, two-step enrolment, bcrypt-hashed recovery codes, replay refused within a code's own window |
+| Sharing / collaboration | `viewer` / `editor` collaborators per warehouse, with the required level named per route and per socket event (§ 2) |
+| Admin tooling | `/api/admin`, gated by `requireRole('admin')`: read the audit trail, see account state, revoke sessions. Deliberately no impersonation and no ownership bypass |
+| Audit logging of security events | The `SecurityEvent` collection, written by `services/securityAudit.js` and read at `/api/admin/security-events` |
 
 ---
 
 ## 11. Known limitations
 
-1. **Rate-limit state is per process.** `express-rate-limit`'s default
-   memory store means limits are not shared across instances, and they
-   reset on restart/redeploy. Render's free tier runs one instance, so this
-   is currently accurate but would need a Redis store before scaling out.
-   The same applies to the socket buckets, which are per connection by
-   design.
+1. **Lockout is per source network, which widens the guess space.**
+   Counting failures per account made lockout a denial-of-service lever:
+   anyone who knew a victim's email could keep them out of their own
+   account. Counting per source network (`loginFailures` in `User.js`)
+   fixes that, and the cost is explicit — an attacker with many source
+   addresses now gets more attempts against one account than before. What
+   bounds that is the per-IP rate limiter, which is the control actually
+   suited to a distributed attack, and `globalFailedLogins`, which records
+   the pattern for the audit trail without acting on it.
 
-2. **Account lockout is a denial-of-service lever.** Someone who knows a
-   victim's email can keep the account locked with repeated bad passwords.
-   The 15-minute window bounds it, and the per-IP limiter makes sustaining
-   it expensive, but it is a real trade-off — the alternative (no lockout)
-   is worse.
+2. **Mail delivery is a transport, and the default transport is not
+   delivery.** Outside production `MAIL_TRANSPORT=console` writes reset and
+   verification links to the server log, which makes the flows usable and
+   testable on a laptop. Production defaults to `none` rather than to
+   `console` — a link printed to a log nobody reads is not a delivered
+   email, and inheriting `console` would mean shipping a password reset
+   that silently does not work. A real deployment must set
+   `MAIL_TRANSPORT=webhook` and point it somewhere.
 
-3. **Simulation engines are cached per warehouse in process memory.** The
-   cache is keyed by warehouse id and populated only through
-   ownership-checked entry points, so it is not a cross-tenant read path,
-   but it is unbounded in the number of warehouses ever touched since
-   restart.
+3. **Recovery codes are the only MFA fallback.** Lose the authenticator and
+   the codes, and an administrator revoking sessions does not help — there
+   is no identity-proofing path back into an account. That is the correct
+   trade for a project with no support desk, but it is a real way to lose
+   an account permanently.
 
-4. **In-memory obstacles are not persisted.** They live in the engine, so
-   they are lost on restart and are not covered by database-level access
-   control — only by the ownership check on the routes that reach them.
+4. **The audit trail is written, read, and never acted on.** Failed logins,
+   lockouts, refresh reuse and authorization denials are recorded and
+   readable at `/api/admin/security-events`. Nothing alerts on them: there
+   is no threshold, no notification, no automatic response. It supports an
+   investigation; it does not start one.
 
-5. **No CSP on the frontend.** The API sends a strict CSP, but it serves no
-   HTML. The Vercel-hosted frontend has no CSP header of its own; adding
-   one is a hosting-configuration change outside this codebase.
+5. **Rate-limit counters cost a round trip when shared.**
+   `RATE_LIMIT_STORE=mongo` (the production default) puts them in the
+   database this app already has, so limits hold across instances and
+   survive a redeploy. Mongo rather than Redis because a rate limiter is
+   not worth an extra piece of infrastructure to run and pay for; the trade
+   is a database round trip per limited request, which Redis would not
+   charge.
 
-6. **`GET /api/health` is public** and reports uptime and database
-   connection state. This is deliberate — Render's health checks need it —
-   but it is a small unauthenticated information disclosure.
+6. **Simulation engines are still cached in process memory.** Bounded now —
+   by idle TTL and an LRU ceiling, with actively-ticking warehouses pinned
+   — so it is no longer unbounded in the number of warehouses ever touched.
+   It remains per process, and it remains a cache of documents the caller
+   was already authorized to read.
 
-7. **Refresh rotation is not transactional.** Issuing the successor and
-   revoking the predecessor are two writes. A crash between them leaves a
-   valid successor and an unrevoked predecessor; the next use of the
-   predecessor is then treated as reuse and kills the family, which fails
-   safe (an unnecessary sign-out) rather than open.
+7. **The frontend CSP is generated, not audited.** It is built from
+   `VITE_API_URL` and emitted as a meta tag plus `_headers` and
+   `vercel.json`, so a deployment gets a real policy by default. It still
+   carries `'unsafe-inline'` for styles, which Vite and recharts both need;
+   script sources take no such concession.
 
-8. **Warehouses created before this phase have no owner** and are invisible
-   to the API until backfilled. See below.
+8. **`GET /api/health` is public**, and now reports only that the process
+   is serving requests. The uptime and database state that used to be there
+   moved to `/api/health/details` behind a session.
+
+9. **Warehouses created before the security phase have no owner** and are
+   invisible to the API until backfilled. See below.
 
 ---
 
@@ -630,6 +822,24 @@ it shows up as every browser request being blocked.
 If Vercel preview deployments need to reach the API, each preview origin
 must be listed too (they get distinct hostnames).
 
+Two more that do not throw on startup but do silently disable a feature:
+
+```
+MAIL_TRANSPORT=webhook                    # else password reset delivers nowhere
+MAIL_WEBHOOK_URL=https://...              # where outbound mail is POSTed
+APP_BASE_URL=https://your-frontend...     # where the emailed links point
+```
+
+Production defaults `MAIL_TRANSPORT` to `none` rather than to `console`,
+deliberately: a reset link written to a log nobody reads is not a delivered
+email, and inheriting the development default would mean shipping a
+password reset that appears to work and does not.
+
+On the **frontend** build, `VITE_API_URL` now does one more job: the
+generated Content-Security-Policy is built from it (§ 7). Getting it wrong
+no longer only breaks the API calls — it produces a policy that blocks
+them.
+
 ### Behaviour changes to expect
 
 - Every API route except `/api/health` now returns 401 without a session.
@@ -643,10 +853,24 @@ must be listed too (they get distinct hostnames).
 - `POST /api/orders` no longer accepts `status` or `assignedRobot` (422).
 - `POST /api/logs` requires `warehouseId` and rejects `source` and `meta`.
 - Illegal order status transitions return 409 instead of being applied.
+- `GET /api/health` reports only `{ service, status }`. Uptime and database
+  state moved to `GET /api/health/details`, which requires a session. A
+  platform health check that only needs a 200 is unaffected.
+- Accounts start unverified. Nothing enforces verification unless
+  `REQUIRE_EMAIL_VERIFICATION=true`, but `emailVerified` is reported on
+  `/api/auth/me` from the start.
+- `POST /api/auth/login` may answer 401 with `code: MFA_REQUIRED` for
+  accounts that have enrolled a second factor. A client that treats every
+  401 as "wrong password" will be confusing to those users.
+- Listing warehouses now returns those **shared with** the caller as well
+  as their own, each carrying an `access` field of `view`/`edit`/`own`.
+- A second backend instance will decline to tick a warehouse the first
+  already holds (`SIMULATION_LEASES`), reporting `blockedBy` in
+  `simulation:status` rather than running a second simulation of it.
 
 ### Verification
 
 ```bash
-cd backend  && npm test          # 519 tests, incl. 165 security tests
-cd frontend && npm run build
+cd backend  && npm test          # 644 tests, incl. 246 security tests
+cd frontend && npm run verify    # lint, typecheck, 395 tests, production build
 ```

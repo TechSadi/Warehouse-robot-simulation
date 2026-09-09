@@ -3,11 +3,17 @@
 // file instead of a vite.config plus a near-duplicate vitest.config.
 import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
+import { securityHeadersPlugin } from './scripts/securityHeaders.js';
 
 // Proxies /api and /socket.io to the backend during local development so the
 // browser only ever talks to one origin (http://localhost:5173).
 export default defineConfig({
-  plugins: [react()],
+  // The API sends a strict CSP and serves no HTML, so until now the policy
+  // that actually governs the dashboard did not exist. This generates one
+  // from VITE_API_URL and emits it three ways - a meta tag that works on
+  // any static host, plus `_headers` and `vercel.json` for the two
+  // documented deployment targets. See scripts/securityHeaders.js.
+  plugins: [react(), securityHeadersPlugin()],
   server: {
     port: 5173,
     proxy: {

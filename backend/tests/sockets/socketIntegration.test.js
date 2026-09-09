@@ -108,12 +108,24 @@ beforeEach(() => {
   // build in this suite - the snapshot comes back empty, which is exactly
   // what a client joining a warehouse with nothing loaded should see.
   Warehouse.findById.mockResolvedValue(null);
-  // The test user owns both warehouses.
+  // The test user owns both warehouses. Access is resolved through
+  // `findAccessibleWarehouse`, whose filter is
+  // `{_id, $or: [{ownerId}, {'collaborators.userId'}]}`, so the asking
+  // user comes out of the $or rather than off a top-level `ownerId`.
   Warehouse.findOne.mockImplementation((filter = {}) => {
     const id = String(filter._id);
-    const owns = String(filter.ownerId) === USER_A_ID;
+    const asking = filter.ownerId ?? filter.$or?.[0]?.ownerId;
+    const owns = String(asking) === USER_A_ID;
     if (!owns || (id !== WAREHOUSE_A && id !== WAREHOUSE_B)) return Promise.resolve(null);
-    return Promise.resolve({ _id: id, ownerId: USER_A_ID, rows: 20, cols: 20, cells: [] });
+    return Promise.resolve({
+      _id: id,
+      ownerId: USER_A_ID,
+      rows: 20,
+      cols: 20,
+      cells: [],
+      collaborators: [],
+      dynamicObstacles: [],
+    });
   });
 });
 
@@ -268,7 +280,15 @@ describe('simulation:start / simulation:stop', () => {
 
     await wait(200); // a few tick intervals at 60ms
     expect(runAutoTick.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(runAutoTick).toHaveBeenCalledWith(WAREHOUSE_A, 0.06);
+    // The step is measured elapsed time rather than the nominal delta, so
+    // it tracks the requested cadence without ever being exactly it - a
+    // late interval advances the world by how late it was. Asserting the
+    // exact value would be asserting that the host was never busy.
+    for (const [warehouseId, delta] of runAutoTick.mock.calls) {
+      expect(warehouseId).toBe(WAREHOUSE_A);
+      expect(delta).toBeGreaterThanOrEqual(0.06);
+      expect(delta).toBeLessThan(0.5);
+    }
 
     const statusOff = nextEvent(client, 'simulation:status');
     client.emit('simulation:stop', { warehouseId: WAREHOUSE_A });

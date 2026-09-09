@@ -30,6 +30,17 @@ const DEADLOCK_REROUTE_THRESHOLD = 3;
 // destinations is far past anything the simulation produces on its own
 // (dispatch queues at most two per order) while still being a hard stop.
 const MAX_TASK_QUEUE = 64;
+// How much charge a travelling robot keeps in hand on top of what its
+// remaining route costs. Without a reserve the break-even point is exactly
+// "arrives with 0%", which every rounding error and every reroute pushes
+// the wrong side of. See _maybeDivertToCharge.
+const BATTERY_RESERVE_PERCENT = 5;
+// How many consecutive ticks a robot may sit stranded with a flat battery
+// before maintenance retrieves it (see _recoverStranded). Long enough that
+// an operator watching the fleet sees the fault happen and can intervene,
+// short enough that an unattended simulation does not slowly fill up with
+// permanent obstacles.
+const STRANDED_RECOVERY_TICKS = 20;
 const EPSILON = 1e-9;
 
 function isWalkable(grid, x, y) {
@@ -99,14 +110,27 @@ function manhattanDistance(a, b) {
  * nothing else queued. See `_maybeAutoCharge`.
  */
 class RobotEngine {
-  constructor(grid) {
+  /**
+   * @param {any} grid
+   * @param {{autoRecoverStranded?: boolean}} [options]
+   *   `autoRecoverStranded` (default true) lets maintenance retrieve a
+   *   robot whose battery reached zero away from a charger - the one
+   *   failure a robot genuinely cannot recover from under its own power.
+   *   Switchable off for tests that want to observe the stranded state
+   *   itself rather than the recovery from it.
+   */
+  constructor(grid, options = {}) {
     this.grid = grid;
     this.robots = new Map();
     this.dynamicObstacles = new DynamicObstacleManager();
+    this.autoRecoverStranded = options.autoRecoverStranded !== false;
     // Computed once - the grid is read-only for this engine's lifetime
     // (see the class doc comment above), so there's no need to rescan it
     // on every low-battery robot's every tick.
     this._chargingCells = this._scanChargingCells();
+    /** Retrievals performed since the last takeRecoveries() call, so the
+     * caller can log and broadcast them - the engine itself has no I/O. */
+    this._recoveries = [];
   }
 
   /** Registers a new robot at `position` and returns its initial state. */
@@ -141,6 +165,13 @@ class RobotEngine {
       errorReason: null,
       waitingTicks: 0,
       autoChargeCooldown: 0,
+      // Set when a trip was queued *in order to* charge, so arrival at the
+      // station starts charging immediately instead of going idle and
+      // waiting for the next tick's low-battery check to notice again.
+      pendingCharge: false,
+      // Consecutive ticks spent stranded with a flat battery - see
+      // _recoverStranded.
+      strandedTicks: 0,
     };
     this.robots.set(id, robot);
     return this._snapshot(robot);
@@ -149,6 +180,54 @@ class RobotEngine {
   /** Removes a robot. Returns true if it existed. */
   removeRobot(id) {
     return this.robots.delete(id);
+  }
+
+  /**
+   * Re-seeds a robot's work from persisted state, at engine construction
+   * time - the one moment state flows from MongoDB into the engine rather
+   * than out of it (see services/simulationManager.js).
+   *
+   * `currentTask` is the destination the robot was actually driving to,
+   * so it goes back to the *front* of the queue: a robot that was halfway
+   * through a delivery resumes that delivery rather than starting the one
+   * behind it. The computed path is deliberately not restored - it lived
+   * only in memory precisely because it describes a world that may have
+   * changed while the process was down - so the destination is replanned
+   * from wherever the robot actually came back.
+   *
+   * Unlike `assignTask` this does not reject an unwalkable destination:
+   * the layout may have changed under a task that was legal when it was
+   * issued. Such a task is kept and fails the normal way (the robot ends
+   * up in `error` with "No path to destination"), which is visible and
+   * retryable, rather than being silently dropped here.
+   *
+   * Returns the robot's snapshot, or null if there is no such robot.
+   */
+  restoreTasks(id, { currentTask = null, taskQueue = [] } = {}) {
+    const robot = this.robots.get(id);
+    if (!robot) return null;
+
+    const cells = [currentTask, ...taskQueue]
+      .filter((t) => t && Number.isInteger(t.x) && Number.isInteger(t.y))
+      .slice(0, MAX_TASK_QUEUE)
+      .map((t) => ({ x: t.x, y: t.y }));
+    if (cells.length === 0) return this._snapshot(robot);
+
+    robot.taskQueue = cells;
+    // A robot restored into `error` or `charging` keeps that state and its
+    // queue: it resumes when it is cleared or finishes charging, through
+    // the same paths any other robot does.
+    if (robot.status === STATUSES.IDLE) this._tryStartNextTask(robot);
+    return this._snapshot(robot);
+  }
+
+  /** Drains the list of maintenance retrievals performed since the last
+   * call. The engine has no I/O of its own, so the caller (tickRunner) is
+   * what turns these into a log line and a client notification. */
+  takeRecoveries() {
+    const recoveries = this._recoveries;
+    this._recoveries = [];
+    return recoveries;
   }
 
   getRobot(id) {
@@ -216,6 +295,7 @@ class RobotEngine {
     robot.path = null;
     robot.pathIndex = 0;
     robot.waitingTicks = 0;
+    robot.pendingCharge = false;
     if (robot.status === STATUSES.MOVING) {
       robot.position = { x: robot.currentCell.x, y: robot.currentCell.y };
       this._setStatus(robot, STATUSES.IDLE);
@@ -230,6 +310,7 @@ class RobotEngine {
     if (robot.status !== STATUSES.ERROR) return this._snapshot(robot);
     this._setStatus(robot, STATUSES.IDLE);
     robot.errorReason = null;
+    robot.strandedTicks = 0; // a person got there before maintenance did
     this._tryStartNextTask(robot);
     return this._snapshot(robot);
   }
@@ -245,6 +326,8 @@ class RobotEngine {
     const robot = this._requireRobot(id);
     this._setStatus(robot, STATUSES.ERROR);
     robot.errorReason = reason;
+    robot.pendingCharge = false;
+    robot.strandedTicks = 0;
     // A robot stopped mid-cell parks on the cell it last fully entered -
     // an integer cell is the only position the rest of the engine (and A*)
     // can plan from once it recovers.
@@ -272,6 +355,12 @@ class RobotEngine {
     return this.dynamicObstacles.getAll();
   }
 
+  /** Re-seeds the runtime hazards from persisted state - see
+   * DynamicObstacleManager.restore and models/Warehouse.js. */
+  restoreObstacles(obstacles) {
+    return this.dynamicObstacles.restore(obstacles);
+  }
+
   /**
    * Advances the whole simulation by `deltaSeconds`. Moving robots consume
    * their speed*deltaSeconds distance budget across the current path,
@@ -291,6 +380,9 @@ class RobotEngine {
     const robots = [...this.robots.values()].sort((a, b) => b.waitingTicks - a.waitingTicks);
     for (const robot of robots) {
       if (robot.status === STATUSES.MOVING) {
+        // Checked before the hazard reroute, because diverting replaces
+        // the path a reroute would have been repairing.
+        this._maybeDivertToCharge(robot);
         if (this._hasHazardOnPath(robot)) this._rerouteAroundHazards(robot);
         if (this._advance(robot, deltaSeconds)) changed.push(this._snapshot(robot));
       } else if (robot.status === STATUSES.CHARGING) {
@@ -298,6 +390,8 @@ class RobotEngine {
         changed.push(this._snapshot(robot));
       } else if (robot.status === STATUSES.IDLE) {
         if (this._maybeAutoCharge(robot)) changed.push(this._snapshot(robot));
+      } else if (robot.status === STATUSES.ERROR) {
+        if (this._recoverStranded(robot)) changed.push(this._snapshot(robot));
       }
     }
     return changed;
@@ -333,10 +427,130 @@ class RobotEngine {
 
   _charge(robot, deltaSeconds) {
     robot.battery = Math.min(100, robot.battery + CHARGE_RATE_PER_SECOND * deltaSeconds);
+    robot.pendingCharge = false; // it is charging; the intent is discharged
     if (robot.battery >= 100) {
       this._setStatus(robot, STATUSES.IDLE);
+      // Whatever it was carrying before it diverted is still at the front
+      // of the queue, so a full battery resumes the interrupted trip.
       this._tryStartNextTask(robot);
     }
+  }
+
+  /**
+   * Stops a robot continuing a route its remaining charge cannot cover.
+   *
+   * `_maybeAutoCharge` below only ever looks at *idle* robots, so the one
+   * way a robot could still strand itself was the obvious one: run flat
+   * part-way through a long trip. That was the root cause behind the
+   * manual-`clearError` limitation - a robot at 0% away from a charger
+   * cannot move to one under its own power, so it stayed broken until a
+   * person intervened. Preventing the depletion is the real fix;
+   * `_recoverStranded` only handles what prevention cannot (a robot that
+   * was already flat, or one whose reserve was eaten by a reroute).
+   *
+   * Deliberately only applied once a robot has actually left its origin
+   * (`pathIndex > 0`). Deciding at dispatch time is the *dispatcher's* job
+   * and it already does it - orderService filters out robots at or below
+   * the low-battery threshold - so re-litigating the first step here would
+   * only second-guess a decision made with more information (which orders
+   * are pending, which robots are free) than this function has. What this
+   * adds is re-evaluation *during* the trip, where the estimate genuinely
+   * changes: a reroute around an obstacle can make a route materially
+   * longer than the one the robot set out on.
+   *
+   * Returns true if the robot was diverted.
+   */
+  _maybeDivertToCharge(robot) {
+    if (!robot.path || robot.pathIndex <= 0) return false;
+    if (robot.pendingCharge) return false; // already on its way to a station
+
+    const remainingCells = robot.path.length - robot.pathIndex;
+    const needed = remainingCells * BATTERY_DRAIN_PER_CELL + BATTERY_RESERVE_PERCENT;
+    if (robot.battery >= needed) return false;
+
+    const station = this._findReachableChargingCell(robot.currentCell);
+    if (!station) return false;
+
+    // Standing on one already - stop here and charge rather than driving
+    // off to a further station.
+    if (station.x === robot.currentCell.x && station.y === robot.currentCell.y) {
+      if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
+      robot.currentTask = null;
+      robot.path = null;
+      robot.pathIndex = 0;
+      this._setStatus(robot, STATUSES.IDLE);
+      this._setStatus(robot, STATUSES.CHARGING);
+      robot.pendingCharge = false;
+      return true;
+    }
+
+    // The interrupted destination goes back to the front of the queue, so
+    // the trip resumes by itself once the battery is full.
+    if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
+    robot.taskQueue.unshift(station);
+    robot.currentTask = null;
+    robot.path = null;
+    robot.pathIndex = 0;
+    robot.pendingCharge = true;
+    if (!this._tryStartNextTask(robot)) {
+      // The station stopped being reachable between the check above and
+      // the plan - drop the intent rather than leaving a robot marked as
+      // heading somewhere it is not.
+      robot.pendingCharge = false;
+    }
+    return true;
+  }
+
+  /**
+   * Maintenance retrieval for a robot whose battery reached zero away from
+   * a charging station.
+   *
+   * This is the one fault in the simulation a robot cannot work its way
+   * out of: `clearError` returns it to `idle`, but idle at 0% still cannot
+   * move, so it sat as a permanent obstacle blocking its cell until a
+   * person clicked a button. Every other error state either resolves
+   * itself or is the direct result of something a client asked for.
+   *
+   * Modelled as a retrieval rather than as free charge: the robot is moved
+   * to the nearest free charging station and charges there, which is what
+   * a warehouse would actually do with a dead unit. It is the one place
+   * the engine relocates a robot without driving it - it has no charge to
+   * drive with - and it only happens after STRANDED_RECOVERY_TICKS, so an
+   * operator watching the fleet sees the fault before it is cleaned up.
+   *
+   * Returns true if the robot was recovered this tick.
+   */
+  _recoverStranded(robot) {
+    if (!this.autoRecoverStranded) return false;
+    // Only flat batteries. A robot marked broken by an operator, or one
+    // that could not find a path, is not stranded - it is in a state
+    // somebody asked for, and clearing it is their call.
+    if (robot.battery > 0) return false;
+
+    robot.strandedTicks += 1;
+    if (robot.strandedTicks < STRANDED_RECOVERY_TICKS) return false;
+
+    const station = this._chargingCells.find(
+      (cell) => !this._occupantOf(cell, robot.id) && isWalkable(this._effectiveGrid(), cell.x, cell.y)
+    );
+    // Nowhere to take it. Reset the counter so this is retried a threshold
+    // later (a station may free up, or an obstacle be cleared) rather than
+    // re-scanning every tick forever.
+    if (!station) {
+      robot.strandedTicks = 0;
+      return false;
+    }
+
+    const from = { x: robot.currentCell.x, y: robot.currentCell.y };
+    robot.position = { x: station.x, y: station.y };
+    robot.currentCell = { x: station.x, y: station.y };
+    robot.strandedTicks = 0;
+    robot.errorReason = null;
+    robot.waitingTicks = 0;
+    this._setStatus(robot, STATUSES.IDLE);
+    this._setStatus(robot, STATUSES.CHARGING);
+    this._recoveries.push({ robotId: robot.id, from, to: { x: station.x, y: station.y } });
+    return true;
   }
 
   /** Milestone 13: called for every idle robot each tick. If its battery is
@@ -370,7 +584,17 @@ class RobotEngine {
     }
 
     robot.taskQueue.push(target);
-    return this._tryStartNextTask(robot);
+    // Recorded as an *intent*, not just a destination. Without it the robot
+    // arrives, goes idle, and only starts charging on the following tick
+    // when this same check runs again and happens to notice it is standing
+    // on a station - a tick during which the dispatcher can hand it another
+    // order and send it away again still flat.
+    robot.pendingCharge = true;
+    if (!this._tryStartNextTask(robot)) {
+      robot.pendingCharge = false;
+      return false;
+    }
+    return true;
   }
 
   /** Every charging cell in the warehouse, closest-first by Manhattan
@@ -460,6 +684,22 @@ class RobotEngine {
         robot.path = null;
         robot.pathIndex = 0;
         robot.currentTask = null;
+
+        // Arrived at a station it set out for specifically in order to
+        // charge (see _maybeDivertToCharge / _maybeAutoCharge). Charging
+        // starts here rather than one tick later, and the rest of the
+        // queue - including whatever trip was interrupted - waits until
+        // the battery is full, which is what _charge resumes.
+        if (robot.pendingCharge && this.grid.isCharging(robot.currentCell.x, robot.currentCell.y)) {
+          robot.pendingCharge = false;
+          this._setStatus(robot, STATUSES.IDLE);
+          this._setStatus(robot, STATUSES.CHARGING);
+          robot.errorReason = null;
+          moved = true;
+          break;
+        }
+        robot.pendingCharge = false;
+
         if (!this._tryStartNextTask(robot)) {
           if (robot.status === STATUSES.MOVING) this._setStatus(robot, STATUSES.IDLE);
           break;
@@ -624,6 +864,9 @@ class RobotEngine {
       robot.battery = 0;
       this._setStatus(robot, STATUSES.ERROR);
       robot.errorReason = 'Battery depleted';
+      robot.pendingCharge = false;
+      // Starts the clock on maintenance retrieval - see _recoverStranded.
+      robot.strandedTicks = 0;
       // Park on the last fully-entered cell rather than freezing part-way
       // between two. A fractional resting position is not a cell any other
       // robot's collision check or any later A* plan can reason about -
@@ -668,4 +911,6 @@ module.exports = {
   LOW_BATTERY_THRESHOLD,
   AUTO_CHARGE_RETRY_TICKS,
   MAX_TASK_QUEUE,
+  BATTERY_RESERVE_PERCENT,
+  STRANDED_RECOVERY_TICKS,
 };

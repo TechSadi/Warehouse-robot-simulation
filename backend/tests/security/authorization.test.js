@@ -218,7 +218,14 @@ describe('IDOR - warehouses', () => {
 
     await asA(request(app).get('/api/warehouses'));
 
-    expect(Warehouse.find).toHaveBeenCalledWith(expect.objectContaining({ ownerId: USER_A_ID }));
+    // Scoped to what this caller can reach: their own warehouses, plus any
+    // shared with them. Never the whole collection - an unscoped listing is
+    // both other tenants' data and a ready-made source of ids to probe.
+    expect(Warehouse.find).toHaveBeenCalledWith(
+      expect.objectContaining({
+        $or: [{ ownerId: USER_A_ID }, { 'collaborators.userId': USER_A_ID }],
+      })
+    );
   });
 });
 

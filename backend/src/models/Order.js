@@ -23,6 +23,25 @@ const orderSchema = new mongoose.Schema(
     status: { type: String, enum: STATUSES, default: 'pending' },
     priority: { type: String, enum: PRIORITIES, default: 'normal' },
     assignedRobot: { type: mongoose.Schema.Types.ObjectId, ref: 'Robot', default: null },
+    /**
+     * The name the robot had when it took this order, copied rather than
+     * referenced.
+     *
+     * `assignedRobot` is a live pointer, and a delivered order outlives the
+     * robot that delivered it - so a completed order used to be left
+     * naming a document that no longer existed. Populating it returned
+     * null and the history simply lost who did the work; that was the
+     * documented dangling-reference limitation.
+     *
+     * Denormalising the name is the right shape for this specific case
+     * rather than a general rule: history is a statement about the past,
+     * and the whole point of a statement about the past is that it does
+     * not change when the present does. Deleting a robot now also clears
+     * `assignedRobot` on its finished orders (services/orderService.js),
+     * so there is no dangling pointer left - and this field is why nothing
+     * is lost when it goes.
+     */
+    assignedRobotName: { type: String, trim: true, maxlength: 60, default: null },
     assignedAt: { type: Date, default: null },
     pickedUpAt: { type: Date, default: null },
     deliveredAt: { type: Date, default: null },

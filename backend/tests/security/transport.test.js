@@ -94,13 +94,24 @@ describe('request body limits', () => {
     expect(res.status).toBe(413);
   });
 
-  it('bounds the number of cells in a layout', async () => {
-    const cells = Array.from({ length: 7000 }, (_, i) => ({ x: i % 79, y: 1, type: 'shelf' }));
-    const res = await authed(request(app).post('/api/warehouses').send({ name: 'W', rows: 10, cols: 10, cells }));
+  it(
+    'bounds the number of cells in a layout',
+    async () => {
+      const cells = Array.from({ length: 7000 }, (_, i) => ({ x: i % 79, y: 1, type: 'shelf' }));
+      const res = await authed(
+        request(app).post('/api/warehouses').send({ name: 'W', rows: 10, cols: 10, cells })
+      );
 
-    expect(res.status).toBe(400);
-    expect(Warehouse.create).not.toHaveBeenCalled();
-  });
+      expect(res.status).toBe(400);
+      expect(Warehouse.create).not.toHaveBeenCalled();
+    },
+    // Running express-validator over 7000 rejected cells is genuinely
+    // seconds of work - that is the cost this limit exists to cap, and
+    // paying it once here is the point of the test. The default 5s ceiling
+    // is a stopwatch on how busy the host is rather than a hang detector,
+    // so give it real headroom.
+    30000
+  );
 });
 
 describe('input validation bounds', () => {

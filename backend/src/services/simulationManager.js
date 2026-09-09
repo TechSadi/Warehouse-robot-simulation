@@ -5,6 +5,7 @@ const { RobotEngine, STATUSES } = require('../engine/robots/robotEngine');
 const { OrderCoordinator } = require('../engine/orders/orderCoordinator');
 const { warehouseToGrid } = require('../engine/grid/warehouseGrid');
 const { IN_FLIGHT_STATUSES } = require('../domain/orderLifecycle');
+const env = require('../config/env');
 
 /**
  * The whole cell a persisted position corresponds to.
@@ -22,6 +23,47 @@ const { IN_FLIGHT_STATUSES } = require('../domain/orderLifecycle');
  */
 function toCell(position) {
   return { x: Math.round(position?.x ?? 0), y: Math.round(position?.y ?? 0) };
+}
+
+/** The persisted shape of a destination, or null. Mongoose subdocuments
+ * carry more than `{x, y}`, so they are narrowed before being compared or
+ * written back. */
+function toDestination(point) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+  return { x: point.x, y: point.y };
+}
+
+function toDestinationList(points) {
+  return (points || []).map(toDestination).filter(Boolean);
+}
+
+/** True if an engine snapshot and a persisted document describe the same
+ * work - used to decide whether a freshly loaded robot needs writing back. */
+function sameTasks(snapshot, doc) {
+  const asKey = (task) => (task ? `${task.x}:${task.y}` : '-');
+  if (asKey(snapshot.currentTask) !== asKey(toDestination(doc.currentTask))) return false;
+  const a = (snapshot.taskQueue || []).map(asKey).join('|');
+  const b = toDestinationList(doc.taskQueue).map(asKey).join('|');
+  return a === b;
+}
+
+/**
+ * Everything the engine owns about one robot, in the shape MongoDB stores
+ * it. One builder for both write paths (`persistRobot` for a single manual
+ * action, `persistRobots` for a whole tick) so the two cannot drift into
+ * persisting different subsets of the same state - which is exactly how
+ * `taskQueue` came to be a schema field nothing wrote.
+ */
+function robotUpdateFrom(snapshot) {
+  return {
+    position: snapshot.position,
+    rotation: snapshot.rotation,
+    battery: snapshot.battery,
+    status: snapshot.status,
+    errorReason: snapshot.errorReason,
+    currentTask: toDestination(snapshot.currentTask),
+    taskQueue: toDestinationList(snapshot.taskQueue),
+  };
 }
 
 /**
@@ -67,6 +109,75 @@ class SimulationManager {
     this.orderCoordinators = new Map();
     /** @type {Map<string, {cursor: number, completedCounts: Map<string, number>}>} */
     this.schedulerStates = new Map();
+
+    /**
+     * When each cached warehouse was last used, and which ones must not be
+     * evicted regardless.
+     *
+     * The cache used to be unbounded in the number of warehouses ever
+     * touched since the process started: every engine holds a grid, a
+     * fleet and an obstacle set, and nothing ever released one. That is
+     * fine for a handful of warehouses and a slow leak for a deployment
+     * with many - the documented "unbounded in the number of warehouses
+     * ever touched since restart" limitation.
+     *
+     * Eviction is by idle time first and by least-recently-used second,
+     * and it is safe precisely because an engine is a *cache*: everything
+     * in it is either derived from MongoDB or persisted back to it on
+     * every tick, so dropping one costs a reload, not data. The one thing
+     * that must never be dropped is a warehouse that is actively ticking -
+     * evicting that mid-simulation would reload it a moment later and
+     * requeue its in-flight orders - so the tick loop pins what it runs.
+     * @type {Map<string, number>}
+     */
+    this.lastUsedAt = new Map();
+    /** @type {Set<string>} */
+    this.pinned = new Set();
+    this.maxCachedEngines = env.simulation.maxCachedEngines;
+    this.engineIdleTtlMs = env.simulation.engineIdleTtlMs;
+  }
+
+  /** Marks a warehouse as in active use, so the cache sweep leaves it
+   * alone. Called by the tick loop when it starts a warehouse. */
+  pin(warehouseId) {
+    this.pinned.add(String(warehouseId));
+  }
+
+  /** Releases a pin. The engine stays cached; it is simply eligible for
+   * eviction again once it goes idle. */
+  unpin(warehouseId) {
+    this.pinned.delete(String(warehouseId));
+  }
+
+  /**
+   * Drops engines that have gone idle, and then the least recently used
+   * ones if the cache is still over its ceiling.
+   *
+   * Runs on access rather than on a timer: a timer would keep the process
+   * (and every test that loads this module) alive, and there is nothing to
+   * sweep on a server that is not being asked for engines.
+   */
+  _sweepCache(exceptKey) {
+    const now = Date.now();
+    const evictable = () =>
+      [...this.engines.keys()].filter((key) => key !== exceptKey && !this.pinned.has(key));
+
+    if (this.engineIdleTtlMs > 0) {
+      for (const key of evictable()) {
+        const lastUsed = this.lastUsedAt.get(key) ?? 0;
+        if (now - lastUsed > this.engineIdleTtlMs) this.invalidate(key);
+      }
+    }
+
+    if (this.maxCachedEngines > 0 && this.engines.size > this.maxCachedEngines) {
+      const byAge = evictable().sort(
+        (a, b) => (this.lastUsedAt.get(a) ?? 0) - (this.lastUsedAt.get(b) ?? 0)
+      );
+      for (const key of byAge) {
+        if (this.engines.size <= this.maxCachedEngines) break;
+        this.invalidate(key);
+      }
+    }
   }
 
   /**
@@ -80,6 +191,7 @@ class SimulationManager {
    */
   async getEngine(warehouseId) {
     const key = String(warehouseId);
+    this.lastUsedAt.set(key, Date.now());
     const cached = this.engines.get(key);
     if (cached) return cached;
 
@@ -90,6 +202,13 @@ class SimulationManager {
       throw err;
     });
     this.engines.set(key, pending);
+    // Swept only on a miss, and only after the new entry is in the map, so
+    // the ceiling is measured against the cache as it will actually be -
+    // sweeping first would compare against a size one short of the truth
+    // and let the cache sit permanently one over. A sweep costs a pass
+    // over the cache, which is why a *hit* does not pay for one: a hit by
+    // definition just refreshed the entry it would be looking at.
+    this._sweepCache(key);
 
     const engine = await pending;
     // A warehouse that does not exist is not cached either - one may be
@@ -109,6 +228,11 @@ class SimulationManager {
 
     const grid = warehouseToGrid(warehouse);
     const engine = new RobotEngine(grid);
+    // Runtime hazards come back before the fleet does, so a robot whose
+    // saved cell is now under a construction zone is judged against the
+    // world as it actually is rather than against a temporarily emptier
+    // one. See models/Warehouse.js on why these are persisted at all.
+    engine.restoreObstacles(warehouse.dynamicObstacles || []);
     const robots = await Robot.find({ warehouseId });
 
     /** Robots whose persisted state could not be reproduced in the engine. */
@@ -143,16 +267,30 @@ class SimulationManager {
         continue;
       }
 
-      // Restore the states worth resuming. A robot that was `moving` is
-      // not resumed: its path lived only in memory and the world may have
-      // changed underneath it, so it comes back idle at its last persisted
-      // cell and is re-dispatched normally. A robot that was `error` stays
+      // Restore the states worth resuming. A robot that was `error` stays
       // broken - a restart is not a repair.
       if (doc.status === STATUSES.CHARGING && grid.isCharging(doc.position.x, doc.position.y)) {
         snapshot = engine.startCharging(id);
       } else if (doc.status === STATUSES.ERROR) {
         snapshot = engine.markBroken(id, doc.errorReason || 'Robot was in an error state before restart');
       }
+
+      // Then the robot's work. A robot that was `moving` still does not
+      // get its *path* back - that lived only in memory precisely because
+      // it describes a world that may have changed while the process was
+      // down - but it does get its destinations back, and it replans to
+      // them from wherever it actually came back. The difference matters:
+      // the previous behaviour dropped the queue entirely, which is what
+      // forced every in-flight order to be released to `pending` and
+      // re-dispatched from scratch after a restart.
+      //
+      // `restoreTasks` is a no-op for a robot with nothing queued, and it
+      // only starts driving a robot that came back idle - a charging or
+      // broken robot keeps its queue and resumes through the normal paths.
+      snapshot = engine.restoreTasks(id, {
+        currentTask: doc.currentTask,
+        taskQueue: doc.taskQueue,
+      }) || snapshot;
 
       // `|| IDLE` mirrors the schema default: a document with no stored
       // status is not a disagreement to write back, it is a robot that has
@@ -161,7 +299,12 @@ class SimulationManager {
       // says which cell it is in.
       const statusChanged = snapshot.status !== (doc.status || STATUSES.IDLE);
       const positionChanged = cell.x !== doc.position.x || cell.y !== doc.position.y;
-      if (statusChanged || positionChanged) corrections.push(snapshot);
+      // A resumed robot has just consumed the first entry of its persisted
+      // queue into `currentTask`, or failed to plan to it - either way the
+      // document no longer describes the robot, so write it back rather
+      // than leaving Mongo a queue ahead of the engine.
+      const tasksChanged = !sameTasks(snapshot, doc);
+      if (statusChanged || positionChanged || tasksChanged) corrections.push(snapshot);
     }
 
     await this.reconcileWarehouse(warehouseId, { unloadable, corrections });
@@ -203,6 +346,8 @@ class SimulationManager {
               battery: snapshot.battery,
               position: snapshot.position,
               errorReason: snapshot.errorReason,
+              currentTask: toDestination(snapshot.currentTask),
+              taskQueue: toDestinationList(snapshot.taskQueue),
             },
           },
         })),
@@ -254,6 +399,7 @@ class SimulationManager {
     this.engines.delete(key);
     this.orderCoordinators.delete(key);
     this.schedulerStates.delete(key);
+    this.lastUsedAt.delete(key);
   }
 
   /** True if this warehouse currently has a live engine in memory. Lets
@@ -261,6 +407,27 @@ class SimulationManager {
    * without forcing a load as a side effect of asking. */
   hasEngine(warehouseId) {
     return this.engines.has(String(warehouseId));
+  }
+
+  /**
+   * The cached engine for a warehouse, or null if none is loaded. Never
+   * builds one.
+   *
+   * This exists because building one is not free of side effects:
+   * `_loadEngine` reconciles the persisted fleet against what it could
+   * actually load, which *writes*. A read endpoint that went through
+   * `getEngine` therefore turned a `GET` into a recovery write - the
+   * documented "recovery runs on a cache miss" side effect. Read paths use
+   * this and fall back to the persisted document instead, so recovery
+   * happens when a simulation is actually being run, which is the only
+   * time it means anything.
+   */
+  async peekEngine(warehouseId) {
+    const key = String(warehouseId);
+    const cached = this.engines.get(key);
+    if (!cached) return null;
+    this.lastUsedAt.set(key, Date.now());
+    return cached;
   }
 
   /**
@@ -329,6 +496,62 @@ class SimulationManager {
     return releasedOrderIds;
   }
 
+  /**
+   * Writes a warehouse's current runtime hazards back to its document.
+   *
+   * Called from the three places the set can change: adding one, removing
+   * one, and a timed one expiring during a tick. It is a whole-array
+   * replace rather than a targeted update because the engine is the
+   * authority - the same reasoning as the blind robot writes below, and
+   * for the same reason it is safe: every caller holds the warehouse lock.
+   *
+   * Failures are logged, not thrown. Losing the persisted copy of a
+   * hazard degrades to the old behaviour (it survives only until the
+   * engine is reloaded); failing the request that created it would be
+   * worse, because the hazard *is* already in the live simulation by then.
+   */
+  async persistObstacles(warehouseId, engine) {
+    if (!engine || typeof engine.getObstacles !== 'function') return;
+    try {
+      await Warehouse.updateOne(
+        { _id: warehouseId },
+        {
+          $set: {
+            dynamicObstacles: engine.getObstacles().map((o) => ({
+              id: o.id,
+              type: o.type,
+              cells: o.cells.map((c) => ({ x: c.x, y: c.y })),
+              remainingSeconds: o.remainingSeconds,
+            })),
+          },
+        }
+      );
+    } catch (err) {
+      console.error(
+        `[simulation] failed to persist dynamic obstacles for warehouse ${warehouseId}:`,
+        err.message
+      );
+    }
+  }
+
+  /**
+   * The hazards for a warehouse without loading (and so reconciling) an
+   * engine for it: the live set if one happens to be loaded, the persisted
+   * set otherwise. This is what read endpoints use - see `peekEngine`.
+   */
+  async readObstacles(warehouseId) {
+    const engine = await this.peekEngine(warehouseId);
+    if (engine) return engine.getObstacles();
+    const warehouse = await Warehouse.findById(warehouseId).select('dynamicObstacles');
+    if (!warehouse) return null;
+    return (warehouse.dynamicObstacles || []).map((o) => ({
+      id: o.id,
+      type: o.type,
+      cells: (o.cells || []).map((c) => ({ x: c.x, y: c.y })),
+      remainingSeconds: o.remainingSeconds ?? null,
+    }));
+  }
+
   /** Returns the persistent scheduling state for a warehouse (round-robin
    * cursor, per-robot completed-order counts), creating it on first use.
    * Does not require the warehouse/engine to exist yet - it is plain
@@ -366,13 +589,7 @@ class SimulationManager {
    * clear-error/mark-broken action) - see persistRobots below for the
    * per-tick, many-robots-at-once case this does not cover well. */
   async persistRobot(robotId, snapshot) {
-    await Robot.findByIdAndUpdate(robotId, {
-      position: snapshot.position,
-      rotation: snapshot.rotation,
-      battery: snapshot.battery,
-      status: snapshot.status,
-      errorReason: snapshot.errorReason,
-    });
+    await Robot.findByIdAndUpdate(robotId, robotUpdateFrom(snapshot));
   }
 
   /**
@@ -399,13 +616,7 @@ class SimulationManager {
       snapshots.map((snapshot) => ({
         updateOne: {
           filter: { _id: snapshot.id },
-          update: {
-            position: snapshot.position,
-            rotation: snapshot.rotation,
-            battery: snapshot.battery,
-            status: snapshot.status,
-            errorReason: snapshot.errorReason,
-          },
+          update: robotUpdateFrom(snapshot),
         },
       })),
       { ordered: false }
