@@ -2,20 +2,41 @@ const { Router } = require('express');
 const { body, param, query } = require('express-validator');
 const controller = require('../controllers/warehouse.controller');
 const validate = require('../middleware/validate');
+const { requireAuth } = require('../middleware/auth');
+const { requireWarehouseParam } = require('../middleware/authorize');
+const {
+  writeLimiter,
+  pathfindingLimiter,
+  traceLimiter,
+  orderGenerationLimiter,
+  dispatchLimiter,
+  tickLimiter,
+} = require('../middleware/rateLimit');
 const { CELL_TYPES } = require('../models/Warehouse');
 const { STRATEGY_KEYS } = require('../engine/scheduling/strategies');
 const { OBSTACLE_TYPES } = require('../engine/obstacles/dynamicObstacles');
 
 const router = Router();
 
+// Every warehouse route requires a signed-in caller, and every route with
+// an `:id` additionally requires that caller to *own* that warehouse
+// (requireWarehouseParam). Authentication alone would still let any signed-
+// in user read and drive every other user's simulation by guessing ids.
+router.use(requireAuth);
+
 const idParam = param('id').isMongoId().withMessage('id must be a valid Mongo ObjectId');
+
+// A layout is bounded at 80x80 = 6400 cells; anything beyond that is not a
+// warehouse, it is a way to make the server serialise an arbitrarily large
+// document on every read.
+const MAX_CELLS = 6400;
 
 const cellBody = body('cells')
   .optional()
-  .isArray()
-  .withMessage('cells must be an array');
-const cellItemBody = body('cells.*.x').optional().isInt({ min: 0 }).withMessage('cell.x must be a non-negative integer');
-const cellItemYBody = body('cells.*.y').optional().isInt({ min: 0 }).withMessage('cell.y must be a non-negative integer');
+  .isArray({ max: MAX_CELLS })
+  .withMessage(`cells must be an array of at most ${MAX_CELLS} entries`);
+const cellItemBody = body('cells.*.x').optional().isInt({ min: 0, max: 79 }).withMessage('cell.x must be an integer between 0 and 79');
+const cellItemYBody = body('cells.*.y').optional().isInt({ min: 0, max: 79 }).withMessage('cell.y must be an integer between 0 and 79');
 const cellItemTypeBody = body('cells.*.type')
   .optional()
   .isIn(CELL_TYPES)
@@ -28,10 +49,11 @@ router.get(
   controller.list
 );
 
-router.get('/:id', [idParam], validate, controller.getOne);
+router.get('/:id', [idParam], validate, requireWarehouseParam(), controller.getOne);
 
 router.post(
   '/',
+  writeLimiter,
   [
     body('name').trim().notEmpty().withMessage('name is required').isLength({ max: 80 }),
     body('rows').isInt({ min: 5, max: 80 }).withMessage('rows must be an integer between 5 and 80'),
@@ -51,6 +73,7 @@ router.post(
 
 router.put(
   '/:id',
+  writeLimiter,
   [
     idParam,
     body('name').optional().trim().notEmpty().isLength({ max: 80 }),
@@ -66,62 +89,89 @@ router.put(
       .withMessage(`schedulingStrategy must be one of: ${STRATEGY_KEYS.join(', ')}`),
   ],
   validate,
+  requireWarehouseParam(),
   controller.update
 );
 
-router.delete('/:id', [idParam], validate, controller.remove);
+router.delete('/:id', [idParam], validate, requireWarehouseParam(), controller.remove);
 
-router.patch('/:id/activate', [idParam], validate, controller.activate);
+router.patch('/:id/activate', [idParam], validate, requireWarehouseParam(), controller.activate);
 
 router.post(
   '/:id/path',
+  pathfindingLimiter,
+  traceLimiter, // only charged for trace:true requests - see rateLimit.js
   [
     idParam,
-    body('start.x').isFloat({ min: 0 }).withMessage('start.x must be a non-negative number'),
-    body('start.y').isFloat({ min: 0 }).withMessage('start.y must be a non-negative number'),
-    body('goal.x').isFloat({ min: 0 }).withMessage('goal.x must be a non-negative number'),
-    body('goal.y').isFloat({ min: 0 }).withMessage('goal.y must be a non-negative number'),
+    // Bounded rather than merely non-negative: the controller additionally
+    // checks the point against this warehouse's actual dimensions.
+    body('start.x').isFloat({ min: 0, max: 79 }).withMessage('start.x must be between 0 and 79'),
+    body('start.y').isFloat({ min: 0, max: 79 }).withMessage('start.y must be between 0 and 79'),
+    body('goal.x').isFloat({ min: 0, max: 79 }).withMessage('goal.x must be between 0 and 79'),
+    body('goal.y').isFloat({ min: 0, max: 79 }).withMessage('goal.y must be between 0 and 79'),
     body('heuristic').optional().isIn(['manhattan', 'euclidean', 'diagonal']),
     body('allowDiagonal').optional().isBoolean(),
     body('trace').optional().isBoolean().withMessage('trace must be true or false'),
   ],
   validate,
+  requireWarehouseParam(),
   controller.findRoute
 );
 
 router.post(
   '/:id/tick',
+  tickLimiter,
   [idParam, body('deltaSeconds').optional().isFloat({ min: 0, max: 10 })],
   validate,
+  requireWarehouseParam(),
   controller.tick
 );
 
 router.post(
   '/:id/orders/generate',
+  orderGenerationLimiter,
   [idParam, body('count').optional().isInt({ min: 1, max: 100 }).withMessage('count must be between 1 and 100')],
   validate,
+  requireWarehouseParam(),
   controller.generateOrders
 );
 
-router.post('/:id/orders/dispatch', [idParam], validate, controller.dispatchOrders);
+router.post(
+  '/:id/orders/dispatch',
+  dispatchLimiter,
+  [idParam],
+  validate,
+  requireWarehouseParam(),
+  controller.dispatchOrders
+);
 
-router.get('/:id/obstacles', [idParam], validate, controller.listObstacles);
+router.get('/:id/obstacles', [idParam], validate, requireWarehouseParam(), controller.listObstacles);
 
 router.post(
   '/:id/obstacles',
+  writeLimiter,
   [
     idParam,
-    body('id').trim().notEmpty().withMessage('id is required'),
+    body('id').trim().notEmpty().withMessage('id is required').isLength({ max: 80 }),
     body('type').isIn(OBSTACLE_TYPES).withMessage(`type must be one of: ${OBSTACLE_TYPES.join(', ')}`),
-    body('cells').isArray({ min: 1 }).withMessage('cells must be a non-empty array'),
-    body('cells.*.x').isInt({ min: 0 }).withMessage('cells[].x must be a non-negative integer'),
-    body('cells.*.y').isInt({ min: 0 }).withMessage('cells[].y must be a non-negative integer'),
-    body('durationSeconds').optional({ nullable: true }).isFloat({ min: 0 }),
+    body('cells')
+      .isArray({ min: 1, max: 400 })
+      .withMessage('cells must be a non-empty array of at most 400 entries'),
+    body('cells.*.x').isInt({ min: 0, max: 79 }).withMessage('cells[].x must be an integer between 0 and 79'),
+    body('cells.*.y').isInt({ min: 0, max: 79 }).withMessage('cells[].y must be an integer between 0 and 79'),
+    body('durationSeconds').optional({ nullable: true }).isFloat({ min: 0, max: 86400 }),
   ],
   validate,
+  requireWarehouseParam(),
   controller.addObstacle
 );
 
-router.delete('/:id/obstacles/:obstacleId', [idParam], validate, controller.removeObstacle);
+router.delete(
+  '/:id/obstacles/:obstacleId',
+  [idParam, param('obstacleId').isString().trim().notEmpty().isLength({ max: 80 })],
+  validate,
+  requireWarehouseParam(),
+  controller.removeObstacle
+);
 
 module.exports = router;

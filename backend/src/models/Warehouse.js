@@ -16,6 +16,19 @@ const cellSchema = new mongoose.Schema(
 
 const warehouseSchema = new mongoose.Schema(
   {
+    // The root of this app's whole authorization model: every robot,
+    // order, obstacle, statistic and log reaches its owner through the
+    // warehouse it belongs to (see middleware/authorize.js). Set from the
+    // authenticated session on create and never from the request body -
+    // a client-settable ownerId would let anyone hand themselves someone
+    // else's warehouse, or plant one in another user's account.
+    ownerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: [true, 'A warehouse must have an owner'],
+      immutable: true,
+      index: true,
+    },
     name: {
       type: String,
       required: [true, 'Warehouse name is required'],
@@ -44,13 +57,24 @@ const warehouseSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-warehouseSchema.index({ isActive: 1 });
+warehouseSchema.index({ ownerId: 1, isActive: 1 });
 
-/** Marks this warehouse active and deactivates every other one. */
-warehouseSchema.statics.activate = async function activate(id) {
-  const warehouse = await this.findById(id);
+/**
+ * Marks this warehouse active and deactivates every *other warehouse of
+ * the same owner*.
+ *
+ * Previously this deactivated every warehouse in the collection, which in
+ * a single-user deployment was merely "one active layout at a time" but in
+ * a multi-user one is a cross-tenant write: activating your warehouse
+ * silently switched off everybody else's. `ownerId` is required rather
+ * than optional so a caller cannot re-acquire the old behaviour by
+ * omitting it.
+ */
+warehouseSchema.statics.activate = async function activate(id, ownerId) {
+  if (!ownerId) throw new Error('Warehouse.activate requires an ownerId');
+  const warehouse = await this.findOne({ _id: id, ownerId });
   if (!warehouse) return null;
-  await this.updateMany({ _id: { $ne: id } }, { $set: { isActive: false } });
+  await this.updateMany({ ownerId, _id: { $ne: id } }, { $set: { isActive: false } });
   warehouse.isActive = true;
   await warehouse.save();
   return warehouse;

@@ -1,0 +1,21 @@
+{
+  "// note": "This project is plain JavaScript. `npm run typecheck` runs tsc over it in checkJs mode - not to add TypeScript, but to catch the class of mistake that costs the most here: a renamed prop, a typo'd import, a call with the wrong number of arguments. Type inference plus JSDoc gets most of that with no source changes and no build-step cost. `strict` stays off deliberately: turning it on against untyped React code produces hundreds of implicit-any complaints that would bury the real findings.",
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "maxNodeModuleJsDepth": 0,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "types": ["vite/client", "vitest/globals"]
+  },
+  "include": ["src/**/*.js", "src/**/*.jsx", "vite.config.js"],
+  "exclude": ["node_modules", "dist", "coverage", "tests/e2e"]
+}

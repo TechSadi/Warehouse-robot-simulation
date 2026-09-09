@@ -126,3 +126,54 @@ button {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Visible to screen readers, invisible on screen. Used for chart summaries,
+   status-level prefixes on log lines, and the grid's text description -
+   content that exists because a canvas or a colour cannot carry it. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* First tab stop on the page. The dashboard puts a nav bar and a full tool
+   sidebar before the grid, so without this a keyboard user tabs through
+   roughly twenty controls to reach the thing the page is about. */
+.skip-link {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 100;
+  transform: translateY(-120%);
+  padding: 10px 16px;
+  background: var(--bg-panel-raised);
+  border: 1px solid var(--cyan);
+  border-radius: 0 0 var(--panel-radius) 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-decoration: none;
+  transition: transform 0.12s ease;
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
+/* Every interactive element gets the same ring, including the ones that are
+   not natively focusable-looking (the canvas, custom pills). */
+:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}

@@ -1,0 +1,202 @@
+.auth-gate {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--bg-void);
+}
+
+.auth-gate__panel {
+  width: 100%;
+  max-width: 400px;
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  padding: 28px;
+}
+
+.auth-gate__brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.auth-gate__mark {
+  width: 10px;
+  height: 10px;
+  background: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-soft);
+  flex-shrink: 0;
+}
+
+.auth-gate__title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.auth-gate__tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--line);
+}
+
+.auth-gate__tab {
+  flex: 1;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 4px;
+  cursor: pointer;
+}
+
+.auth-gate__tab.is-active {
+  color: var(--amber);
+  border-bottom-color: var(--amber);
+}
+
+.auth-gate__form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-gate__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.auth-gate__field label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.auth-gate__field input {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--bg-void);
+  border: 1px solid var(--line-bright);
+  padding: 9px 10px;
+}
+
+.auth-gate__field input:focus {
+  outline: none;
+  border-color: var(--amber);
+}
+
+.auth-gate__hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.auth-gate__error {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--danger);
+  border-left: 2px solid var(--danger);
+  padding-left: 10px;
+}
+
+.auth-gate__submit {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bg-void);
+  background: var(--amber);
+  border: none;
+  padding: 10px;
+  margin-top: 4px;
+  cursor: pointer;
+}
+
+.auth-gate__submit:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.auth-gate__footnote {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* Shown while the app asks the server who the caller is, before it knows
+   whether to render the dashboard or this gate. */
+.auth-gate__loading {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-void);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.auth-gate__loading {
+  gap: 10px;
+}
+
+.auth-gate__loading-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line-bright);
+  border-top-color: var(--cyan);
+  animation: auth-spin 0.7s linear infinite;
+}
+
+@keyframes auth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* `:focus` alone removed the outline for keyboard users too. Keep the amber
+   border as the resting focus affordance, and restore a real ring when the
+   browser says the focus came from a keyboard. */
+.auth-gate__field input:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 1px;
+}
+
+.auth-gate__submit:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+@media (pointer: coarse) {
+  .auth-gate__field input {
+    font-size: 16px;
+    padding: 11px 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .auth-gate {
+    padding: 16px;
+  }
+
+  .auth-gate__panel {
+    padding: 24px 20px;
+  }
+}

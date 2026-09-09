@@ -14,6 +14,7 @@ jest.mock('../../src/models/Order', () => ({
   find: jest.fn(),
   insertMany: jest.fn(),
   findByIdAndUpdate: jest.fn(),
+  updateMany: jest.fn(),
   bulkWrite: jest.fn(),
 }));
 
@@ -55,6 +56,9 @@ beforeEach(() => {
   jest.clearAllMocks();
   simulationManager.invalidate(WAREHOUSE_ID);
   Order.findByIdAndUpdate.mockResolvedValue({});
+  // Engine construction reconciles in-flight orders back to `pending` -
+  // see simulationManager.reconcileWarehouse.
+  Order.updateMany.mockResolvedValue({ modifiedCount: 0 });
   Order.bulkWrite.mockResolvedValue({});
   Robot.findByIdAndUpdate.mockResolvedValue({});
   Robot.bulkWrite.mockResolvedValue({});
@@ -79,11 +83,15 @@ describe('dispatchPendingOrders', () => {
     // state, not one findByIdAndUpdate call per assignment.
     expect(Robot.bulkWrite).toHaveBeenCalledTimes(1);
     expect(Robot.bulkWrite.mock.calls[0][0]).toHaveLength(2);
+    // The filter carries the lifecycle guard as well as the id: the
+    // simulation goes through the same state machine the REST API does
+    // (domain/orderLifecycle.js), applied atomically so an order that
+    // stopped being dispatchable mid-pass is not overwritten.
     expect(Order.bulkWrite).toHaveBeenCalledWith(
       expect.arrayContaining([
         expect.objectContaining({
           updateOne: expect.objectContaining({
-            filter: { _id: 'o1' },
+            filter: { _id: 'o1', status: { $in: ['pending'] } },
             update: expect.objectContaining({ status: 'assigned', assignedRobot: expect.any(String) }),
           }),
         }),
@@ -170,8 +178,20 @@ describe('processTickEvents', () => {
     // cheap to guard against) can never apply out of sequence.
     expect(Order.bulkWrite).toHaveBeenCalledWith(
       [
-        { updateOne: { filter: { _id: 'o1' }, update: expect.objectContaining({ status: 'picked_up' }) } },
-        { updateOne: { filter: { _id: 'o2' }, update: expect.objectContaining({ status: 'delivered' }) } },
+        {
+          updateOne: {
+            // Only from a state that legally precedes picked_up - a
+            // cancelled order is not resurrected by an in-flight tick.
+            filter: { _id: 'o1', status: { $in: ['assigned', 'picking_up'] } },
+            update: expect.objectContaining({ status: 'picked_up' }),
+          },
+        },
+        {
+          updateOne: {
+            filter: { _id: 'o2', status: { $in: ['picked_up', 'delivering'] } },
+            update: expect.objectContaining({ status: 'delivered' }),
+          },
+        },
       ],
       { ordered: true }
     );
@@ -192,10 +212,28 @@ describe('processTickEvents', () => {
     expect(Log.create).toHaveBeenCalledWith(expect.objectContaining({ level: 'warn' }));
   });
 
-  it('does not call bulkWrite when there are no order-affecting events', async () => {
+  it('releases an unreachable delivery back to pending rather than stranding it', async () => {
+    // Reliability phase: the coordinator has already dropped its
+    // assignment by the time this event arrives, so if the document is not
+    // returned to `pending` the order sits in an in-flight state with no
+    // robot working it and no way back into the dispatch pool.
     await orderService.processTickEvents(WAREHOUSE_ID, [
       { type: 'delivery_unreachable', robotId: 'r1', orderId: 'o1' },
     ]);
+
+    const [ops] = Order.bulkWrite.mock.calls[0];
+    expect(ops).toEqual([
+      {
+        updateOne: {
+          filter: { _id: 'o1', status: { $in: ['assigned', 'picking_up', 'picked_up', 'delivering'] } },
+          update: { status: 'pending', assignedRobot: null, assignedAt: null, pickedUpAt: null },
+        },
+      },
+    ]);
+  });
+
+  it('does not call bulkWrite when there are no order-affecting events', async () => {
+    await orderService.processTickEvents(WAREHOUSE_ID, []);
     expect(Order.bulkWrite).not.toHaveBeenCalled();
   });
 });

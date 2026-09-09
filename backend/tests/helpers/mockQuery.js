@@ -9,6 +9,10 @@ function mockQuery(resolvedValue) {
     sort: jest.fn(() => query),
     skip: jest.fn(() => query),
     limit: jest.fn(() => query),
+    // The ownership middleware narrows its warehouse lookup with
+    // `.select('_id')` - see middleware/authorize.js.
+    select: jest.fn(() => query),
+    lean: jest.fn(() => query),
     then: (onFulfilled, onRejected) => Promise.resolve(resolvedValue).then(onFulfilled, onRejected),
     catch: (onRejected) => Promise.resolve(resolvedValue).catch(onRejected),
   };

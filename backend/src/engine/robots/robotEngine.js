@@ -1,6 +1,7 @@
 const { findPath } = require('../pathfinding/astar');
 const RobotEngineError = require('./robotEngineError');
 const { DynamicObstacleManager } = require('../obstacles/dynamicObstacles');
+const robotLifecycle = require('../../domain/robotLifecycle');
 
 const STATUSES = { IDLE: 'idle', MOVING: 'moving', CHARGING: 'charging', ERROR: 'error' };
 
@@ -22,6 +23,13 @@ const AUTO_CHARGE_RETRY_TICKS = 10;
 // prevents two robots deadlocked in a head-on wait from staying stuck
 // forever when a bypass actually exists.
 const DEADLOCK_REROUTE_THRESHOLD = 3;
+// A robot's queue is runtime-only and grows one entry per assignTask call.
+// `POST /api/robots/:id/tasks` is a client-driven path into it, so without
+// a ceiling a caller can make one robot's queue grow without bound - and
+// every entry is re-planned as the robot works through it. 64 queued
+// destinations is far past anything the simulation produces on its own
+// (dispatch queues at most two per order) while still being a hard stop.
+const MAX_TASK_QUEUE = 64;
 const EPSILON = 1e-9;
 
 function isWalkable(grid, x, y) {
@@ -104,6 +112,9 @@ class RobotEngine {
   /** Registers a new robot at `position` and returns its initial state. */
   spawnRobot({ id, name, position, speed = DEFAULT_SPEED, battery = 100 }) {
     if (!id) throw new RobotEngineError('INVALID_ARGUMENT', 'spawnRobot requires an id');
+    if (!position || !Number.isInteger(position.x) || !Number.isInteger(position.y)) {
+      throw new RobotEngineError('INVALID_ARGUMENT', 'spawnRobot requires an integer {x, y} cell position');
+    }
     if (this.robots.has(id)) {
       throw new RobotEngineError('DUPLICATE_ROBOT', `A robot with id "${id}" already exists`);
     }
@@ -157,8 +168,14 @@ class RobotEngine {
    */
   assignTask(id, destination) {
     const robot = this._requireRobot(id);
+    if (!Number.isInteger(destination.x) || !Number.isInteger(destination.y)) {
+      throw new RobotEngineError('INVALID_ARGUMENT', 'Destination must have integer cell coordinates');
+    }
     if (!isWalkable(this._effectiveGrid(), destination.x, destination.y)) {
       throw new RobotEngineError('UNWALKABLE_POSITION', `Destination (${destination.x}, ${destination.y}) is not walkable`);
+    }
+    if (robot.taskQueue.length >= MAX_TASK_QUEUE) {
+      throw new RobotEngineError('TASK_QUEUE_FULL', `Robot "${id}" already has ${MAX_TASK_QUEUE} destinations queued`);
     }
 
     robot.taskQueue.push({ x: destination.x, y: destination.y });
@@ -176,11 +193,33 @@ class RobotEngine {
       throw new RobotEngineError('INVALID_TRANSITION', 'Cannot start charging while moving');
     }
     if (robot.status === STATUSES.CHARGING) return this._snapshot(robot);
-    if (!this.grid.isCharging(robot.position.x, robot.position.y)) {
+    if (!this.grid.isCharging(robot.currentCell.x, robot.currentCell.y)) {
       throw new RobotEngineError('NOT_AT_CHARGING_STATION', 'Robot must be on a charging cell to charge');
     }
-    robot.status = STATUSES.CHARGING;
+    this._setStatus(robot, STATUSES.CHARGING);
     robot.errorReason = null;
+    return this._snapshot(robot);
+  }
+
+  /** Discards every destination this robot has queued, and abandons the one
+   * it is currently driving to, leaving it idle where it stands (or, if it
+   * is mid-cell, at the cell it last fully entered). Used when the *reason*
+   * for those destinations goes away - a cancelled or reassigned order -
+   * so the robot does not keep driving a route nobody is waiting on. A
+   * robot in the `error` state keeps that state: clearing its work is not
+   * repairing it. */
+  clearTasks(id) {
+    const robot = this.robots.get(id);
+    if (!robot) return null;
+    robot.taskQueue = [];
+    robot.currentTask = null;
+    robot.path = null;
+    robot.pathIndex = 0;
+    robot.waitingTicks = 0;
+    if (robot.status === STATUSES.MOVING) {
+      robot.position = { x: robot.currentCell.x, y: robot.currentCell.y };
+      this._setStatus(robot, STATUSES.IDLE);
+    }
     return this._snapshot(robot);
   }
 
@@ -189,7 +228,7 @@ class RobotEngine {
   clearError(id) {
     const robot = this._requireRobot(id);
     if (robot.status !== STATUSES.ERROR) return this._snapshot(robot);
-    robot.status = STATUSES.IDLE;
+    this._setStatus(robot, STATUSES.IDLE);
     robot.errorReason = null;
     this._tryStartNextTask(robot);
     return this._snapshot(robot);
@@ -204,8 +243,12 @@ class RobotEngine {
    * same way as any other error, via `clearError`. */
   markBroken(id, reason = 'Robot marked as broken') {
     const robot = this._requireRobot(id);
-    robot.status = STATUSES.ERROR;
+    this._setStatus(robot, STATUSES.ERROR);
     robot.errorReason = reason;
+    // A robot stopped mid-cell parks on the cell it last fully entered -
+    // an integer cell is the only position the rest of the engine (and A*)
+    // can plan from once it recovers.
+    robot.position = { x: robot.currentCell.x, y: robot.currentCell.y };
     if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
     robot.currentTask = null;
     robot.path = null;
@@ -268,10 +311,30 @@ class RobotEngine {
     return robot;
   }
 
+  /**
+   * The single place a robot's status is written.
+   *
+   * The legal moves are declared once, in domain/robotLifecycle.js, and
+   * shared with the REST layer - but until now only the REST layer was
+   * checked against them, while the engine assigned `robot.status`
+   * directly in eight places. Nothing forced the two to agree, so the
+   * authoritative state machine was authoritative over the side door and
+   * not over the front one. Routing every engine transition through this
+   * assertion makes the table describe what actually happens: an illegal
+   * move is a programming error here and fails loudly in tests rather than
+   * silently producing a robot in a state the rest of the system does not
+   * expect (a `moving` robot with no path, a `charging` robot mid-aisle).
+   */
+  _setStatus(robot, next) {
+    if (robot.status === next) return;
+    robotLifecycle.assertTransition(robot.status, next);
+    robot.status = next;
+  }
+
   _charge(robot, deltaSeconds) {
     robot.battery = Math.min(100, robot.battery + CHARGE_RATE_PER_SECOND * deltaSeconds);
     if (robot.battery >= 100) {
-      robot.status = STATUSES.IDLE;
+      this._setStatus(robot, STATUSES.IDLE);
       this._tryStartNextTask(robot);
     }
   }
@@ -289,8 +352,8 @@ class RobotEngine {
     if (robot.taskQueue.length > 0) return false; // don't preempt an explicitly queued destination
     if (robot.battery <= 0) return false; // can't move to get there anyway
 
-    if (this.grid.isCharging(robot.position.x, robot.position.y)) {
-      robot.status = STATUSES.CHARGING;
+    if (this.grid.isCharging(robot.currentCell.x, robot.currentCell.y)) {
+      this._setStatus(robot, STATUSES.CHARGING);
       robot.errorReason = null;
       return true;
     }
@@ -347,10 +410,17 @@ class RobotEngine {
     if (robot.battery <= 0) return false; // stay idle; can't move with no charge
 
     const destination = robot.taskQueue.shift();
-    const result = findPath(this._effectiveGrid(), robot.position, destination);
+    // Planned from `currentCell`, never from `position`. The two differ
+    // only while a robot is part-way between cells, but `position` is then
+    // fractional - and A* is a *grid* search, so a fractional start cell
+    // matches no node it can ever expand: the search would explore the
+    // whole reachable grid and report "no path" for a destination that is
+    // plainly reachable. That was reachable in practice via clearError() on
+    // a robot whose battery ran out mid-step.
+    const result = findPath(this._effectiveGrid(), robot.currentCell, destination);
 
     if (!result.found) {
-      robot.status = STATUSES.ERROR;
+      this._setStatus(robot, STATUSES.ERROR);
       robot.errorReason = `No path to destination (${destination.x}, ${destination.y})`;
       // Keep the destination retryable (e.g. via clearError() once an
       // obstacle is cleared) instead of silently dropping it.
@@ -370,7 +440,7 @@ class RobotEngine {
     robot.path = waypoints;
     robot.pathIndex = 0;
     robot.currentTask = destination;
-    robot.status = STATUSES.MOVING;
+    this._setStatus(robot, STATUSES.MOVING);
     return true;
   }
 
@@ -391,7 +461,7 @@ class RobotEngine {
         robot.pathIndex = 0;
         robot.currentTask = null;
         if (!this._tryStartNextTask(robot)) {
-          if (robot.status === STATUSES.MOVING) robot.status = STATUSES.IDLE;
+          if (robot.status === STATUSES.MOVING) this._setStatus(robot, STATUSES.IDLE);
           break;
         }
         continue; // re-enter loop to spend any leftover budget on the new path
@@ -552,8 +622,13 @@ class RobotEngine {
     const drain = distance * BATTERY_DRAIN_PER_CELL;
     if (drain >= robot.battery) {
       robot.battery = 0;
-      robot.status = STATUSES.ERROR;
+      this._setStatus(robot, STATUSES.ERROR);
       robot.errorReason = 'Battery depleted';
+      // Park on the last fully-entered cell rather than freezing part-way
+      // between two. A fractional resting position is not a cell any other
+      // robot's collision check or any later A* plan can reason about -
+      // see the note in _tryStartNextTask.
+      robot.position = { x: robot.currentCell.x, y: robot.currentCell.y };
       // Put the interrupted destination back at the front of the queue so
       // it resumes automatically once the robot is recharged and cleared.
       if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
@@ -592,4 +667,5 @@ module.exports = {
   DEADLOCK_REROUTE_THRESHOLD,
   LOW_BATTERY_THRESHOLD,
   AUTO_CHARGE_RETRY_TICKS,
+  MAX_TASK_QUEUE,
 };

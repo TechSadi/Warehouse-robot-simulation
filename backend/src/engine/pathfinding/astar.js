@@ -26,6 +26,34 @@ function inBounds(grid, x, y) {
   return x >= 0 && y >= 0 && x < grid.cols && y < grid.rows;
 }
 
+/**
+ * A* here is a search over *integer* grid cells: every node is identified
+ * by `"x:y"` and every neighbour is one whole cell away. A start or goal
+ * that is not an integer cell therefore names a node the search can never
+ * reach - it explores an entire fractional lattice offset from the real
+ * grid and then reports "no path" after burning `maxIterations`. Rejecting
+ * such input up front turns a worst-case search into a constant-time
+ * answer, and it is the same answer: there is no path to a cell that is
+ * not a cell.
+ */
+function isCellCoordinate(point) {
+  return Boolean(point) && Number.isInteger(point.x) && Number.isInteger(point.y);
+}
+
+/**
+ * The iteration ceiling, guarded against a grid whose dimensions are not
+ * usable numbers. `rows * cols * 8` becomes NaN for a malformed grid, and
+ * `iterations < NaN` is false - which happens to fail safe, but by
+ * accident rather than by decision, and it would silently return "no path"
+ * for a grid that merely had string dimensions. Resolving it explicitly
+ * means a malformed grid is rejected before the loop instead.
+ */
+function iterationCeiling(grid, override) {
+  if (Number.isFinite(override)) return Math.max(0, override);
+  if (!Number.isFinite(grid.rows) || !Number.isFinite(grid.cols)) return 0;
+  return Math.max(0, grid.rows * grid.cols * 8);
+}
+
 function isWalkable(grid, x, y) {
   return inBounds(grid, x, y) && !grid.isBlocked(x, y);
 }
@@ -109,10 +137,12 @@ function* astarSteps(grid, start, goal, options = {}) {
   const {
     heuristic = 'manhattan',
     allowDiagonal = false,
-    maxIterations = grid.rows * grid.cols * 8,
+    maxIterations: maxIterationsOption,
     trace = false,
     emitSteps = true,
+    maxEmitSteps = Infinity,
   } = options;
+  const maxIterations = iterationCeiling(grid, maxIterationsOption);
   const h = getHeuristic(heuristic);
   const startedAt = process.hrtime.bigint();
 
@@ -125,6 +155,15 @@ function* astarSteps(grid, start, goal, options = {}) {
     heuristic,
     allowDiagonal,
   };
+
+  // Coordinate validation precedes the walkability check because
+  // `isWalkable` would happily accept (1.5, 2.5) or (NaN, 0): both are
+  // "in bounds" by comparison and "not blocked" by a Set lookup that will
+  // never contain them.
+  if (!isCellCoordinate(start) || !isCellCoordinate(goal)) {
+    result.executionTimeMs = msSince(startedAt);
+    return result;
+  }
 
   if (!isWalkable(grid, start.x, start.y) || !isWalkable(grid, goal.x, goal.y)) {
     result.executionTimeMs = msSince(startedAt);
@@ -167,7 +206,9 @@ function* astarSteps(grid, start, goal, options = {}) {
       result.path = path;
       result.cost = current.g;
       result.executionTimeMs = msSince(startedAt);
-      if (emitSteps) yield stepSnapshot({ current, openSet, closedSet, gScore, cameFrom, iterations, goal, h, trace });
+      if (emitSteps && iterations <= maxEmitSteps) {
+        yield stepSnapshot({ current, openSet, closedSet, gScore, cameFrom, iterations, goal, h, trace });
+      }
       return result;
     }
 
@@ -186,7 +227,9 @@ function* astarSteps(grid, start, goal, options = {}) {
       }
     }
 
-    if (emitSteps) yield stepSnapshot({ current, openSet, closedSet, gScore, cameFrom, iterations, goal, h, trace });
+    if (emitSteps && iterations <= maxEmitSteps) {
+      yield stepSnapshot({ current, openSet, closedSet, gScore, cameFrom, iterations, goal, h, trace });
+    }
   }
 
   result.executionTimeMs = msSince(startedAt);
@@ -269,7 +312,19 @@ const DEFAULT_MAX_TRACE_STEPS = 400;
  */
 function findPathWithTrace(grid, start, goal, options = {}) {
   const { maxTraceSteps = DEFAULT_MAX_TRACE_STEPS } = options;
-  const iterator = astarSteps(grid, start, goal, { ...options, trace: true });
+  // `maxEmitSteps` stops the generator *building* snapshots once enough
+  // have been collected, rather than building every one and discarding the
+  // overflow here. Each traced snapshot is O(frontier + closed set), so on
+  // a dense 80x80 maze the discarded ones dominated the whole request -
+  // tens of thousands of full node lists constructed so that 400 could be
+  // kept. The search itself still runs to completion, so `found`, `path`,
+  // `cost`, `nodesExplored` and `executionTimeMs` are unchanged; only the
+  // work behind `stepsTruncated: true` is.
+  const iterator = astarSteps(grid, start, goal, {
+    ...options,
+    trace: true,
+    maxEmitSteps: maxTraceSteps,
+  });
   const steps = [];
   let stepsTruncated = false;
 
@@ -283,7 +338,19 @@ function findPathWithTrace(grid, start, goal, options = {}) {
     step = iterator.next();
   }
 
+  // The generator stops emitting at the cap, so the loop above can no
+  // longer observe the overflow it used to count. The search having
+  // expanded more nodes than were recorded is exactly what truncation
+  // means.
+  if (nodesExploredOf(step) > steps.length) stepsTruncated = true;
+
   return { ...step.value, steps, stepsTruncated };
+}
+
+/** The generator's return value carries the search totals; a step-capped
+ * run still reports how many nodes it really expanded. */
+function nodesExploredOf(step) {
+  return step?.value?.nodesExplored ?? 0;
 }
 
 module.exports = { findPath, findPathWithTrace, astarSteps };

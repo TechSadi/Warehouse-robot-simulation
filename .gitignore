@@ -15,6 +15,12 @@ build/
 *.logs 
 npm-debug.log*
 
+# Test output
+coverage/
+playwright-report/
+test-results/
+.playwright/
+
 # OS files
 .DS_Store
 Thumbs.db 
@@ -22,4 +28,3 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-

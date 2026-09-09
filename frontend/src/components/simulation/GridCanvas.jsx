@@ -197,14 +197,27 @@ function drawPathVisualization(ctx, viz, cellSize) {
   }
 }
 
-const GridCanvas = forwardRef(function GridCanvas(
-  {
+/**
+ * The floor plan itself: a single canvas that draws the grid, the fleet, the
+ * dynamic obstacles and the A* trace, with pan/zoom and both pointer and
+ * keyboard editing.
+ *
+ * Props are read through refs rather than closed over, so a robot update
+ * twice a second schedules one animation frame instead of re-creating every
+ * handler on the element.
+ *
+ * @param {any} props
+ * @param {any} ref
+ */
+const GridCanvas = forwardRef(function GridCanvas(/** @type {any} */ props, ref) {
+  const {
     grid,
     selectedCell,
     hoveredCell,
     isPaintTool,
     robots,
     heatmap,
+    heatmapEpoch,
     showHeatmap,
     obstacles,
     pathVisualization,
@@ -213,9 +226,9 @@ const GridCanvas = forwardRef(function GridCanvas(
     onCellPaint,
     onCellErase,
     onZoomChange,
-  },
-  ref
-) {
+    onMoveSelection,
+    gridLabel,
+  } = props;
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
   const viewportRef = useRef({ scale: 1, offsetX: 0, offsetY: 0 });
@@ -433,9 +446,24 @@ const GridCanvas = forwardRef(function GridCanvas(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gridDimsKey]);
 
+  // The heatmap Map is mutated in place by useLiveSimulation rather than
+  // replaced (copying it on every tick was pure garbage), so its identity is
+  // not a useful dependency. Robot movement is what fills it, and `robots`
+  // below already covers that; `heatmapEpoch` covers the one case robot
+  // updates do not - the user clearing it.
   useEffect(() => {
     scheduleDraw();
-  }, [grid, selectedCell, hoveredCell, robots, heatmap, showHeatmap, obstacles, pathVisualization, scheduleDraw]);
+  }, [
+    grid,
+    selectedCell,
+    hoveredCell,
+    robots,
+    heatmapEpoch,
+    showHeatmap,
+    obstacles,
+    pathVisualization,
+    scheduleDraw,
+  ]);
 
   useEffect(() => {
     function onKeyDown(e) {
@@ -553,10 +581,51 @@ const GridCanvas = forwardRef(function GridCanvas(
     return () => canvas.removeEventListener('wheel', handleWheel);
   }, []);
 
+  /**
+   * Keyboard equivalents for the pointer interactions.
+   *
+   * A canvas has no per-cell DOM for the browser to focus, so every editing
+   * action here - selecting a cell, placing an object, erasing one - used
+   * to require a mouse. Arrow keys move the selection, Enter applies the
+   * active tool to it, Delete clears it. The selection ring the pointer
+   * already drew doubles as the keyboard cursor, so there is nothing new
+   * to learn and nothing extra to render.
+   *
+   * Space is deliberately not bound: it is already hold-to-pan.
+   */
+  function handleKeyDown(e) {
+    const sel = selectedRef.current;
+
+    const step = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[e.key];
+    if (step) {
+      e.preventDefault();
+      onMoveSelection?.(step[0], step[1]);
+      return;
+    }
+
+    if (e.key === 'Enter' && sel) {
+      e.preventDefault();
+      onCellClick(sel.x, sel.y);
+      return;
+    }
+
+    if ((e.key === 'Delete' || e.key === 'Backspace') && sel) {
+      e.preventDefault();
+      onCellErase(sel.x, sel.y);
+    }
+  }
+
   return (
     <div className="grid-canvas" ref={containerRef}>
       <canvas
         ref={canvasRef}
+        tabIndex={0}
+        role="application"
+        aria-label={
+          gridLabel ||
+          'Warehouse grid. Arrow keys move the selected cell, Enter places the active tool, Delete clears it.'
+        }
+        onKeyDown={handleKeyDown}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}

@@ -1,0 +1,153 @@
+.feedback {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.feedback--info {
+  color: var(--text-secondary);
+}
+
+.feedback--warn {
+  color: var(--amber);
+}
+
+.feedback--error {
+  color: var(--danger);
+}
+
+.feedback--success {
+  color: var(--success);
+}
+
+/* --- Loading -------------------------------------------------------------- */
+
+.feedback--loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+
+.feedback__spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--line-bright);
+  border-top-color: var(--cyan);
+  animation: feedback-spin 0.7s linear infinite;
+}
+
+@keyframes feedback-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Reduced motion still needs to read as "busy", so the spinner keeps its
+   shape and pulses opacity instead of rotating. */
+@media (prefers-reduced-motion: reduce) {
+  .feedback__spinner {
+    animation: none;
+    border-top-color: var(--cyan);
+    opacity: 0.7;
+  }
+}
+
+/* --- Empty ---------------------------------------------------------------- */
+
+.feedback--empty {
+  border: 1px dashed var(--line-bright);
+  border-radius: var(--panel-radius);
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.feedback__title {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.feedback__hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+/* --- Error ---------------------------------------------------------------- */
+
+.feedback--error.feedback--error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+div.feedback--error {
+  border: 1px solid rgba(229, 72, 77, 0.35);
+  background: var(--danger-soft);
+  border-radius: var(--panel-radius);
+  padding: 12px;
+}
+
+div.feedback--error .feedback__title {
+  color: var(--danger);
+}
+
+/* --- Banner --------------------------------------------------------------- */
+
+.banner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--panel-radius);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.banner--error {
+  background: var(--danger-soft);
+  border: 1px solid rgba(229, 72, 77, 0.35);
+  color: var(--danger);
+}
+
+.banner--warn {
+  background: var(--amber-soft);
+  border: 1px solid rgba(245, 166, 35, 0.35);
+  color: var(--amber);
+}
+
+.banner--success {
+  background: var(--success-soft);
+  border: 1px solid rgba(74, 222, 128, 0.35);
+  color: var(--success);
+}
+
+.banner--info {
+  background: var(--cyan-soft);
+  border: 1px solid rgba(61, 218, 215, 0.3);
+  color: var(--cyan);
+}
+
+.banner__text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.banner__dismiss {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 3px;
+}

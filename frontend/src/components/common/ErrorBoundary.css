@@ -1,0 +1,22 @@
+.error-boundary {
+  background: var(--bg-panel);
+  border: 1px solid rgba(229, 72, 77, 0.35);
+  border-radius: var(--panel-radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.error-boundary__title {
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.error-boundary__detail {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}

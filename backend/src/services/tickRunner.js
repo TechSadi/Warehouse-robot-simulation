@@ -1,5 +1,6 @@
 const simulationManager = require('./simulationManager');
 const orderService = require('./orderService');
+const warehouseLock = require('./warehouseLock');
 const Log = require('../models/Log');
 const simulationEvents = require('../events/simulationEvents');
 
@@ -23,24 +24,60 @@ const lastObstacleSnapshot = new Map();
  * modules (simulationManager doesn't know tickRunner exists). */
 function forgetWarehouse(warehouseId) {
   lastObstacleSnapshot.delete(String(warehouseId));
+  warehouseLock.forget(warehouseId);
 }
 
 /**
- * Advances one warehouse's live simulation by `deltaSeconds` and broadcasts
- * the results over simulationEvents (see src/events/simulationEvents.js) so
- * every connected client watching this warehouse sees it in real time -
- * regardless of whether this tick was triggered by the server-side
- * interval loop (src/sockets/tickLoopManager.js) or a manual
- * POST /api/warehouses/:id/tick call. Both paths call this one function so
- * there's a single source of truth for what "advance the simulation" does
- * (this replaces the logic that used to live directly in
- * warehouse.controller.js's `tick` handler).
+ * The one mechanism that advances simulation time.
+ *
+ * Every way to move a warehouse forward - `POST /api/warehouses/:id/tick`,
+ * the server-owned interval loop (src/sockets/tickLoopManager.js), and any
+ * future scheduler - lands here, so "what a tick does" is defined once.
+ * What changed in the reliability phase is that it is now also defined to
+ * happen *alone*: the body runs inside this warehouse's lock
+ * (services/warehouseLock.js), so a tick cannot interleave with another
+ * tick, a dispatch, an obstacle change, a robot being created or deleted,
+ * or a simulation being started or stopped.
+ *
+ * It needed to. `engine.tick()` mutates every robot, then this function
+ * awaits a Mongo write, then a second await for order events, then a
+ * third for dispatch. Each of those is a yield point at which a second
+ * caller used to be free to run `engine.tick()` again on a fleet whose
+ * previous tick had not been persisted or reconciled yet - producing
+ * double movement in one interval, order events attributed to the wrong
+ * tick, and robots persisted from a snapshot that was already stale.
  *
  * Returns null if the warehouse doesn't exist; otherwise
  * { changed, orderEvents, dispatched }, the same shape the REST endpoint
  * has always returned.
  */
 async function runTick(warehouseId, deltaSeconds = 1) {
+  return warehouseLock.runExclusive(warehouseId, () => runTickLocked(warehouseId, deltaSeconds));
+}
+
+/**
+ * A tick for the automatic loop: skipped outright when the warehouse is
+ * already busy, rather than queued behind whatever is running.
+ *
+ * `setInterval` does not wait for an async callback, so at 2Hz a tick that
+ * takes longer than 500ms (a large fleet, a slow write, a replan storm)
+ * used to have the next one start on top of it. Queueing them instead
+ * would only defer the problem: the backlog drains as a burst of catch-up
+ * ticks that fast-forward the simulation. Dropping is the honest option -
+ * that interval simply produced no motion.
+ *
+ * Returns `{ skipped: true }` or `{ skipped: false, value }`.
+ */
+function runAutoTick(warehouseId, deltaSeconds = 1) {
+  return warehouseLock.tryRunExclusive(warehouseId, () => runTickLocked(warehouseId, deltaSeconds));
+}
+
+/**
+ * The tick body. Assumes the caller already holds this warehouse's lock -
+ * it calls `orderService.dispatchPendingOrdersLocked` for exactly that
+ * reason, since re-entering the lock from inside it would deadlock.
+ */
+async function runTickLocked(warehouseId, deltaSeconds) {
   const engine = await simulationManager.getEngine(warehouseId);
   const coordinator = await simulationManager.getOrderCoordinator(warehouseId);
   if (!engine || !coordinator) return null;
@@ -70,9 +107,9 @@ async function runTick(warehouseId, deltaSeconds = 1) {
     })
   );
 
-  // orderService.dispatchPendingOrders emits its own 'orders:changed' when
-  // it actually assigns something - see services/orderService.js.
-  const dispatched = await orderService.dispatchPendingOrders(warehouseId);
+  // orderService.dispatchPendingOrdersLocked emits its own 'orders:changed'
+  // when it actually assigns something - see services/orderService.js.
+  const dispatched = await orderService.dispatchPendingOrdersLocked(warehouseId);
 
   const obstacles = typeof engine.getObstacles === 'function' ? engine.getObstacles() : [];
   const serialized = JSON.stringify(obstacles);
@@ -84,4 +121,4 @@ async function runTick(warehouseId, deltaSeconds = 1) {
   return { changed, orderEvents, dispatched };
 }
 
-module.exports = { runTick, forgetWarehouse };
+module.exports = { runTick, runAutoTick, forgetWarehouse };

@@ -7,17 +7,25 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "lint": "node --check src/server.js",
-    "test": "MONGO_URI=mongodb://127.0.0.1:27017/warehouse-sim-test jest --runInBand",
-    "benchmark": "node scripts/benchmark.js"
+    "lint": "node scripts/lint.js",
+    "test": "jest --runInBand",
+    "benchmark": "node scripts/benchmark.js",
+    "test:security": "jest tests/security --runInBand",
+    "test:reliability": "jest tests/reliability --runInBand",
+    "check:reliability": "node scripts/reliability-check.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "compression": "^1.7.4",
+    "cookie": "^0.7.2",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-rate-limit": "^8.7.0",
     "express-validator": "^7.2.0",
     "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.5.0",
     "morgan": "^1.10.0",
     "socket.io": "^4.7.5"
@@ -30,5 +38,14 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "setupFiles": [
+      "<rootDir>/tests/setup/globalMocks.js"
+    ]
   }
 }

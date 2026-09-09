@@ -106,3 +106,77 @@
 .sim-canvas__readout-hint {
   color: var(--text-muted);
 }
+
+/* --- Run-state badges ------------------------------------------------------
+   The two facts a person needs from the picture itself: is it advancing, and
+   is what I am looking at current. Both used to be inferable only by
+   watching for movement, which is indistinguishable from a stalled socket. */
+.sim-canvas__badges {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 8px;
+  z-index: 3;
+  pointer-events: none;
+  max-width: calc(100% - 80px);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.sim-canvas__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-bright);
+  background: rgba(18, 22, 27, 0.9);
+  backdrop-filter: blur(4px);
+  white-space: nowrap;
+}
+
+.sim-canvas__badge--running {
+  color: var(--success);
+  border-color: rgba(74, 222, 128, 0.45);
+}
+
+.sim-canvas__badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 6px var(--success);
+  animation: run-pulse 1.6s ease-in-out infinite;
+}
+
+.sim-canvas__badge--stale {
+  color: var(--amber);
+  border-color: rgba(245, 166, 35, 0.45);
+}
+
+/* On a narrow screen the pointer hints are irrelevant (there is no hover and
+   no right-click) and the readout eats a third of the canvas. */
+@media (max-width: 700px) {
+  .sim-canvas {
+    padding: 8px;
+  }
+
+  .sim-canvas__readout-hint {
+    display: none;
+  }
+
+  .sim-canvas__readout:empty,
+  .sim-canvas__readout:not(:has(.sim-canvas__readout-coord)) {
+    display: none;
+  }
+
+  .sim-canvas__axis-label {
+    display: none;
+  }
+}

@@ -1,12 +1,26 @@
 const { Router } = require('express');
 const { body, param, query } = require('express-validator');
+const Robot = require('../models/Robot');
 const controller = require('../controllers/robot.controller');
 const validate = require('../middleware/validate');
+const { requireAuth } = require('../middleware/auth');
+const {
+  requireOwnedResource,
+  requireWarehouseBody,
+  scopeListToOwner,
+} = require('../middleware/authorize');
+const { writeLimiter } = require('../middleware/rateLimit');
 const { STATUSES } = require('../models/Robot');
 
 const router = Router();
 
+router.use(requireAuth);
+
 const idParam = param('id').isMongoId().withMessage('id must be a valid Mongo ObjectId');
+// Resolves :id to a robot the caller's warehouse actually contains, or
+// 404s. Every single-robot route below goes through it, so no handler ever
+// sees an id it has not had authorized.
+const ownedRobot = () => requireOwnedResource(Robot, 'Robot');
 
 router.get(
   '/',
@@ -15,65 +29,73 @@ router.get(
     query('status').optional().isIn(STATUSES).withMessage(`status must be one of: ${STATUSES.join(', ')}`),
   ],
   validate,
+  scopeListToOwner(),
   controller.list
 );
 
-router.get('/:id', [idParam], validate, controller.getOne);
+router.get('/:id', [idParam], validate, ownedRobot(), controller.getOne);
 
 router.post(
   '/',
+  writeLimiter,
   [
     body('name').trim().notEmpty().withMessage('name is required').isLength({ max: 60 }),
     body('warehouseId').isMongoId().withMessage('warehouseId must be a valid Mongo ObjectId'),
-    body('position.x').optional().isFloat({ min: 0 }),
-    body('position.y').optional().isFloat({ min: 0 }),
-    body('rotation').optional().isFloat({ min: 0, max: 360 }),
-    body('speed').optional().isFloat({ min: 0 }),
+    // Integer, not float: a robot is spawned into a cell (see the
+    // controller). Fractional positions belong to the simulation, which
+    // produces them while a robot is between two cells.
+    body('position.x').optional().isInt({ min: 0, max: 79 }).withMessage('position.x must be a whole cell index'),
+    body('position.y').optional().isInt({ min: 0, max: 79 }).withMessage('position.y must be a whole cell index'),
+    body('speed').optional().isFloat({ min: 0, max: 20 }),
     body('battery').optional().isFloat({ min: 0, max: 100 }),
-    body('status').optional().isIn(STATUSES).withMessage(`status must be one of: ${STATUSES.join(', ')}`),
   ],
   validate,
+  requireWarehouseBody(),
   controller.create
 );
 
+// `status`, `battery`, `position`, `rotation` are intentionally not
+// accepted here - see the DTO comment in robot.controller.js. Attempting
+// one is a 422 pointing at the endpoint that owns that transition, rather
+// than a silently ignored field.
 router.put(
   '/:id',
+  writeLimiter,
   [
     idParam,
     body('name').optional().trim().notEmpty().isLength({ max: 60 }),
-    body('warehouseId').optional().isMongoId(),
-    body('position.x').optional().isFloat({ min: 0 }),
-    body('position.y').optional().isFloat({ min: 0 }),
-    body('rotation').optional().isFloat({ min: 0, max: 360 }),
-    body('speed').optional().isFloat({ min: 0 }),
-    body('battery').optional().isFloat({ min: 0, max: 100 }),
-    body('status').optional().isIn(STATUSES).withMessage(`status must be one of: ${STATUSES.join(', ')}`),
+    body('speed').optional().isFloat({ min: 0, max: 20 }),
   ],
   validate,
+  ownedRobot(),
   controller.update
 );
 
-router.delete('/:id', [idParam], validate, controller.remove);
+router.delete('/:id', [idParam], validate, ownedRobot(), controller.remove);
 
 router.post(
   '/:id/tasks',
+  writeLimiter,
   [
     idParam,
-    body('destination.x').isFloat({ min: 0 }).withMessage('destination.x must be a non-negative number'),
-    body('destination.y').isFloat({ min: 0 }).withMessage('destination.y must be a non-negative number'),
+    body('destination.x').isFloat({ min: 0, max: 79 }).withMessage('destination.x must be between 0 and 79'),
+    body('destination.y').isFloat({ min: 0, max: 79 }).withMessage('destination.y must be between 0 and 79'),
   ],
   validate,
+  ownedRobot(),
   controller.assignTask
 );
 
-router.post('/:id/charge', [idParam], validate, controller.startCharging);
+router.post('/:id/charge', writeLimiter, [idParam], validate, ownedRobot(), controller.startCharging);
 
-router.post('/:id/clear-error', [idParam], validate, controller.clearError);
+router.post('/:id/clear-error', writeLimiter, [idParam], validate, ownedRobot(), controller.clearError);
 
 router.post(
   '/:id/break',
-  [idParam, body('reason').optional().trim().isLength({ max: 200 })],
+  writeLimiter,
+  [idParam, body('reason').optional().isString().trim().isLength({ max: 200 })],
   validate,
+  ownedRobot(),
   controller.markBroken
 );
 

@@ -48,6 +48,12 @@ picks its next task," not two versions that could drift apart.
 
 ## The tick loop
 
+> The simulation core - state ownership, the concurrency model, the two
+> state machines, restart recovery, and Socket.IO resynchronisation - is
+> documented in full in
+> [`SIMULATION_ARCHITECTURE.md`](./SIMULATION_ARCHITECTURE.md). This
+> section is the short version.
+
 A "tick" is one simulation step: move every robot, process any
 pickup/delivery transitions that just happened, dispatch newly-idle
 robots onto pending orders. `tickRunner.runTick(warehouseId, deltaSeconds)`
@@ -70,6 +76,14 @@ Every changed robot snapshot from a tick is persisted in one
 see [`backend/scripts/benchmark.js`](../backend/scripts/benchmark.js) for
 measured throughput at the target scale of 50 simultaneous robots.
 
+Both entry points, and every other operation that mutates one warehouse's
+simulation, run through that warehouse's serialized queue
+(`services/warehouseLock.js`), so no two of them are ever in flight at
+once. Automatic ticks that arrive while one is still running are dropped
+rather than queued, so a slow tick cannot build a backlog that later
+replays as a burst - see
+[the concurrency model](./SIMULATION_ARCHITECTURE.md#3-concurrency-model).
+
 ## Real-time layer
 
 ```mermaid
@@ -90,7 +104,7 @@ sequenceDiagram
 module (`tickRunner`, `orderService`, the warehouse/robot controllers)
 emits into. `sockets/index.js` is the *only* thing that listens,
 translating each event into a broadcast to the matching warehouse's room.
-This indirection is why the 265 backend tests never need to know
+This indirection is why most of the backend suite never needs to know
 Socket.IO exists: they mock the services directly and never load the
 sockets module, so emitting into an unlistened bus is a no-op. See the
 event catalogue in [`API.md`](./API.md#socketio-events).
@@ -106,9 +120,17 @@ event catalogue in [`API.md`](./API.md#socketio-events).
   per-node snapshot built at all (a 54.8x speedup on a search exploring
   ~1,800 nodes - see the development log).
 - **`findPathWithTrace`** drains it while collecting every yielded
-  snapshot (`trace: true`, `emitSteps` left at its default), capped at
-  400 recorded frames regardless of how long the search actually runs.
-  This is what powers the AI Visualisation Panel's step-by-step scrubber.
+  snapshot (`trace: true`), capped at 400 recorded frames regardless of
+  how long the search actually runs. This is what powers the AI
+  Visualisation Panel's step-by-step scrubber. The cap is now passed into
+  the generator as `maxEmitSteps`, so snapshots past it are never built
+  rather than built and discarded.
+
+Start, goal and grid dimensions are validated before the search runs -
+a fractional, non-finite or out-of-bounds coordinate names a cell this
+grid search can never reach, and is answered in constant time instead of
+after exhausting the iteration ceiling. See
+[A* architecture](./SIMULATION_ARCHITECTURE.md#8-a-architecture).
 
 Both paths share the same search - there's no risk of the "fast" and
 "visualized" versions of A* disagreeing, because they're the same code
@@ -148,45 +170,54 @@ Documented here rather than silently left for someone to discover:
   require touching `robot.controller.js`'s `create` handler in a way
   that risked hanging the existing test suite (see that milestone's entry
   in the development log for the full reasoning).
-- **No cascading deletes.** Deleting a `Warehouse` leaves its robots,
-  orders, statistics, and logs in place. For a demo project this is
-  arguably a feature (nothing you generated disappears by accident), but
-  it does mean orphaned documents accumulate if you delete warehouses
-  during testing.
-- **No authentication, no per-user data isolation.** See
-  [Security notes](#security-notes) below.
 - **`Robot.taskQueue` in the schema isn't the live source of truth.** The
   Robot Engine keeps its own in-memory task queue of plain
   `{x, y}` destinations during simulation; the schema field is reserved,
   not currently written by the running simulation. See the field's own
   comment in `Robot.js`.
-- **Frontend has no automated test suite.** Every frontend milestone was
-  verified by a clean production build - not by unit or integration
-  tests. The backend (265 tests) carries essentially all of this
-  project's automated test coverage.
+- **Canvas rendering is not covered by any automated test.** The frontend
+  now has 317 Vitest tests and 17 Playwright end-to-end specs (see
+  [`FRONTEND_ARCHITECTURE.md`](./FRONTEND_ARCHITECTURE.md#6-testing)), but
+  jsdom has no 2D context and Playwright can only assert that the canvas
+  element exists - not what was drawn on it. `GridCanvas.jsx` therefore
+  sits at ~45% coverage and rendering regressions are still caught by
+  looking, not by CI.
 
 ## Security notes
 
-This is a demo/portfolio project, and its security posture reflects
-that - worth being explicit about before deploying it anywhere it might
-be reachable by strangers, or using it as a template for something that
-handles real data:
+Superseded by [`SECURITY.md`](./SECURITY.md), which is the authoritative
+document. Summarised here because the rest of this file refers to it.
 
-- **No authentication or authorization anywhere.** Every REST endpoint
-  and every Socket.IO room is open to anyone who can reach the server.
-  Knowing (or guessing) a warehouse's ObjectId is sufficient to read and
-  modify it.
-- **CORS is origin-restricted but credential-agnostic.** `CLIENT_ORIGINS`
-  (see [`DEPLOYMENT.md`](./DEPLOYMENT.md#backend-environment-variables)) locks
-  which origins can call the API and open a socket connection, which is
-  real protection against a *browser-based* random third-party site
-  calling your deployed API - but nothing stops a direct, non-browser
-  request (`curl`, a script) from any origin, since CORS is a
-  browser-enforced mechanism, not a server-side access control.
-- **No rate limiting.** A public deployment on a free-tier host is
-  reachable by anyone at whatever rate they choose to send requests.
-- Before using this as a foundation for anything real: add
-  authentication (even a simple API key would meaningfully raise the
-  bar), scope every query to an authenticated user/tenant rather than a
-  guessable warehouse id, and add rate limiting at the reverse-proxy or
-  application layer.
+The project was originally built with no authentication at all: every REST
+endpoint and every Socket.IO room was open to anyone who could reach the
+server, and knowing (or guessing) a warehouse's ObjectId was enough to
+read and modify it. The security phase replaced that with:
+
+- **Cookie-based authentication** - short-lived JWT access tokens plus
+  rotating, revocable refresh tokens, both in httpOnly cookies. bcrypt
+  password hashing, per-IP and per-account login throttling, uniform
+  responses so the login form is not an account-existence oracle.
+- **Resource-level authorization** - every robot, order, obstacle,
+  statistic and log reaches its owner through the warehouse it belongs to
+  (`Warehouse.ownerId`). One middleware module answers every ownership
+  question for both REST and Socket.IO; another user's resource returns
+  `404`, indistinguishable from one that never existed.
+- **Allow-list DTOs on every write path**, so `ownerId`, `role`,
+  simulation state, and server-recorded timestamps are not client-settable.
+- **Shared domain state machines** for the order and robot lifecycles, so
+  the generic CRUD endpoints cannot bypass rules the simulation engine
+  enforces.
+- **Socket.IO handshake authentication**, per-event authorization, payload
+  validation, and per-socket event rate limiting.
+- **Tiered HTTP rate limiting**, strict CORS with no wildcard-plus-
+  credentials, Helmet, and double-submit CSRF protection.
+
+CORS remains a browser-enforced mechanism rather than an access control -
+a direct `curl` request is not subject to it. That is no longer the
+problem it was, because `requireAuth` now gates every route regardless of
+where the request came from.
+
+What is still *not* covered - email verification, password reset, MFA,
+sharing between accounts, and security-event audit logging - is listed
+with the rest of the residual risk in
+[`SECURITY.md`](./SECURITY.md#10-threat-model).

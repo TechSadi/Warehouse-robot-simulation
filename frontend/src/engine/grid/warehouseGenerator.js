@@ -25,6 +25,10 @@ function randInt(rng, min, max) {
  * scattering of Obstacle cells is added across whatever floor space is
  * left - something this function never produced at all before.
  */
+/**
+ * @param {{ rows?: number, cols?: number, density?: string, chargingStations?: number,
+ *   docks?: number, obstacleDensity?: number, rng?: () => number }} [options]
+ */
 export function generateWarehouseLayout({
   rows,
   cols,

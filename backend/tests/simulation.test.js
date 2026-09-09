@@ -1,5 +1,6 @@
 const request = require('supertest');
 const RobotEngineError = require('../src/engine/robots/robotEngineError');
+const { authed, mockOwnership, makeWarehouse, USER_A_ID } = require('./helpers/auth');
 
 const VALID_ID = '507f1f77bcf86cd799439011';
 const WAREHOUSE_ID = '507f1f77bcf86cd799439022';
@@ -25,7 +26,12 @@ jest.mock('../src/services/simulationManager', () => ({
 jest.mock('../src/services/orderService', () => ({
   generateOrders: jest.fn(),
   dispatchPendingOrders: jest.fn(),
+  // The tick path calls the already-locked variant: it runs inside the
+  // warehouse lock and re-entering it would deadlock.
+  dispatchPendingOrdersLocked: jest.fn(),
   processTickEvents: jest.fn(),
+  releaseOrders: jest.fn(),
+  releaseOrdersForRobot: jest.fn(),
 }));
 
 jest.mock('../src/models/Log', () => ({
@@ -33,10 +39,21 @@ jest.mock('../src/models/Log', () => ({
   LEVELS: ['info', 'warn', 'error'],
 }));
 
+// Ownership is resolved through the warehouse on every route below - see
+// middleware/authorize.js.
+jest.mock('../src/models/Warehouse', () => ({
+  find: jest.fn(),
+  findById: jest.fn(),
+  findOne: jest.fn(),
+  countDocuments: jest.fn(),
+  CELL_TYPES: ['shelf', 'charging', 'obstacle', 'dock'],
+}));
+
 const Robot = require('../src/models/Robot');
 const Log = require('../src/models/Log');
 const simulationManager = require('../src/services/simulationManager');
 const orderService = require('../src/services/orderService');
+const Warehouse = require('../src/models/Warehouse');
 const app = require('../src/app');
 
 function fakeEngine(overrides = {}) {
@@ -52,10 +69,15 @@ function fakeEngine(overrides = {}) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockOwnership(Warehouse, {
+    warehouse: makeWarehouse(WAREHOUSE_ID, USER_A_ID, { rows: 20, cols: 20 }),
+  });
+  Robot.findById.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
   simulationManager.persistRobot.mockResolvedValue();
   simulationManager.persistRobots.mockResolvedValue();
   orderService.processTickEvents.mockResolvedValue();
   orderService.dispatchPendingOrders.mockResolvedValue([]);
+  orderService.dispatchPendingOrdersLocked.mockResolvedValue([]);
 });
 
 function fakeCoordinator(overrides = {}) {
@@ -69,9 +91,9 @@ describe('POST /api/robots/:id/tasks', () => {
     const engine = fakeEngine({ assignTask: jest.fn().mockReturnValue(snapshot) });
     simulationManager.getEngine.mockResolvedValue(engine);
 
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/robots/${VALID_ID}/tasks`)
-      .send({ destination: { x: 3, y: 4 } });
+      .send({ destination: { x: 3, y: 4 } }));
 
     expect(res.status).toBe(200);
     expect(res.body.data).toEqual(snapshot);
@@ -81,18 +103,18 @@ describe('POST /api/robots/:id/tasks', () => {
 
   it('returns 404 when the robot does not exist', async () => {
     Robot.findById.mockResolvedValue(null);
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/robots/${VALID_ID}/tasks`)
-      .send({ destination: { x: 1, y: 1 } });
+      .send({ destination: { x: 1, y: 1 } }));
     expect(res.status).toBe(404);
   });
 
   it("returns 404 when the robot's warehouse no longer exists", async () => {
     Robot.findById.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
     simulationManager.getEngine.mockResolvedValue(null);
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/robots/${VALID_ID}/tasks`)
-      .send({ destination: { x: 1, y: 1 } });
+      .send({ destination: { x: 1, y: 1 } }));
     expect(res.status).toBe(404);
   });
 
@@ -100,9 +122,9 @@ describe('POST /api/robots/:id/tasks', () => {
     Robot.findById.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
     const engine = fakeEngine({ getRobot: jest.fn().mockReturnValue(null) });
     simulationManager.getEngine.mockResolvedValue(engine);
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/robots/${VALID_ID}/tasks`)
-      .send({ destination: { x: 1, y: 1 } });
+      .send({ destination: { x: 1, y: 1 } }));
     expect(res.status).toBe(409);
   });
 
@@ -115,16 +137,16 @@ describe('POST /api/robots/:id/tasks', () => {
     });
     simulationManager.getEngine.mockResolvedValue(engine);
 
-    const res = await request(app)
+    const res = await authed(request(app)
       .post(`/api/robots/${VALID_ID}/tasks`)
-      .send({ destination: { x: 1, y: 1 } });
+      .send({ destination: { x: 1, y: 1 } }));
 
     expect(res.status).toBe(400);
     expect(res.body.error.message).toMatch(/not walkable/);
   });
 
   it('rejects a request missing destination coordinates', async () => {
-    const res = await request(app).post(`/api/robots/${VALID_ID}/tasks`).send({});
+    const res = await authed(request(app).post(`/api/robots/${VALID_ID}/tasks`).send({}));
     expect(res.status).toBe(400);
   });
 });
@@ -136,7 +158,7 @@ describe('POST /api/robots/:id/charge', () => {
     const engine = fakeEngine({ startCharging: jest.fn().mockReturnValue(snapshot) });
     simulationManager.getEngine.mockResolvedValue(engine);
 
-    const res = await request(app).post(`/api/robots/${VALID_ID}/charge`);
+    const res = await authed(request(app).post(`/api/robots/${VALID_ID}/charge`));
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('charging');
   });
@@ -150,7 +172,7 @@ describe('POST /api/robots/:id/charge', () => {
     });
     simulationManager.getEngine.mockResolvedValue(engine);
 
-    const res = await request(app).post(`/api/robots/${VALID_ID}/charge`);
+    const res = await authed(request(app).post(`/api/robots/${VALID_ID}/charge`));
     expect(res.status).toBe(409);
   });
 
@@ -163,7 +185,7 @@ describe('POST /api/robots/:id/charge', () => {
     });
     simulationManager.getEngine.mockResolvedValue(engine);
 
-    const res = await request(app).post(`/api/robots/${VALID_ID}/charge`);
+    const res = await authed(request(app).post(`/api/robots/${VALID_ID}/charge`));
     expect(res.status).toBe(409);
   });
 });
@@ -175,7 +197,7 @@ describe('POST /api/robots/:id/clear-error', () => {
     const engine = fakeEngine({ clearError: jest.fn().mockReturnValue(snapshot) });
     simulationManager.getEngine.mockResolvedValue(engine);
 
-    const res = await request(app).post(`/api/robots/${VALID_ID}/clear-error`);
+    const res = await authed(request(app).post(`/api/robots/${VALID_ID}/clear-error`));
     expect(res.status).toBe(200);
     expect(res.body.data.errorReason).toBeNull();
   });
@@ -192,16 +214,16 @@ describe('POST /api/warehouses/:id/tick', () => {
     const coordinator = fakeCoordinator({ processTick: jest.fn().mockReturnValue(orderEvents) });
     simulationManager.getEngine.mockResolvedValue(engine);
     simulationManager.getOrderCoordinator.mockResolvedValue(coordinator);
-    orderService.dispatchPendingOrders.mockResolvedValue([{ orderId: 'o2', robotId: 'r2' }]);
+    orderService.dispatchPendingOrdersLocked.mockResolvedValue([{ orderId: 'o2', robotId: 'r2' }]);
 
-    const res = await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({ deltaSeconds: 0.5 });
+    const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({ deltaSeconds: 0.5 }));
 
     expect(res.status).toBe(200);
     expect(res.body.data.count).toBe(2);
     expect(engine.tick).toHaveBeenCalledWith(0.5);
     expect(coordinator.processTick).toHaveBeenCalledWith(changed);
     expect(orderService.processTickEvents).toHaveBeenCalledWith(WAREHOUSE_ID, orderEvents);
-    expect(orderService.dispatchPendingOrders).toHaveBeenCalledWith(WAREHOUSE_ID);
+    expect(orderService.dispatchPendingOrdersLocked).toHaveBeenCalledWith(WAREHOUSE_ID);
     expect(res.body.data.orderEvents).toEqual(orderEvents);
     expect(res.body.data.dispatched).toEqual([{ orderId: 'o2', robotId: 'r2' }]);
     expect(simulationManager.persistRobots).toHaveBeenCalledWith(changed);
@@ -216,7 +238,7 @@ describe('POST /api/warehouses/:id/tick', () => {
     simulationManager.getEngine.mockResolvedValue(engine);
     simulationManager.getOrderCoordinator.mockResolvedValue(fakeCoordinator());
 
-    await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({});
+    await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({}));
 
     expect(Log.create).toHaveBeenCalledTimes(1);
     expect(Log.create).toHaveBeenCalledWith(
@@ -229,19 +251,19 @@ describe('POST /api/warehouses/:id/tick', () => {
     simulationManager.getEngine.mockResolvedValue(engine);
     simulationManager.getOrderCoordinator.mockResolvedValue(fakeCoordinator());
 
-    await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({});
+    await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({}));
     expect(engine.tick).toHaveBeenCalledWith(1);
   });
 
   it('returns 404 when the warehouse does not exist', async () => {
     simulationManager.getEngine.mockResolvedValue(null);
     simulationManager.getOrderCoordinator.mockResolvedValue(null);
-    const res = await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({});
+    const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({}));
     expect(res.status).toBe(404);
   });
 
   it('rejects a deltaSeconds outside the allowed range', async () => {
-    const res = await request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({ deltaSeconds: 20 });
+    const res = await authed(request(app).post(`/api/warehouses/${WAREHOUSE_ID}/tick`).send({ deltaSeconds: 20 }));
     expect(res.status).toBe(400);
   });
 });

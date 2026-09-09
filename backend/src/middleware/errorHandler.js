@@ -10,10 +10,21 @@ class ApiError extends Error {
   }
 }
 
-/** Catches requests that didn't match any route. */
+/** Catches requests that didn't match any route. The path is echoed back
+ * truncated and with the query string dropped - a 404 body is a reflection
+ * point, and there is no reason for it to carry an arbitrary-length
+ * attacker-chosen string (or the query parameters, which on this API can
+ * contain ids). */
 function notFound(req, res, next) {
-  next(new ApiError(404, `Route not found: ${req.method} ${req.originalUrl}`));
+  const path = String(req.path || '').slice(0, 120);
+  next(new ApiError(404, `Route not found: ${req.method} ${path}`));
 }
+
+// Illegal domain state transitions (see src/domain/) - one mapping for
+// both the order and robot state machines.
+const DOMAIN_TRANSITION_ERRORS = new Set(['OrderTransitionError', 'RobotTransitionError']);
+
+const JWT_ERRORS = new Set(['JsonWebTokenError', 'TokenExpiredError', 'NotBeforeError']);
 
 const ROBOT_ENGINE_ERROR_STATUS = {
   ROBOT_NOT_FOUND: 404,
@@ -22,6 +33,9 @@ const ROBOT_ENGINE_ERROR_STATUS = {
   INVALID_ARGUMENT: 400,
   INVALID_TRANSITION: 409,
   NOT_AT_CHARGING_STATION: 409,
+  CELL_OCCUPIED: 409,
+  TASK_QUEUE_FULL: 409,
+  DUPLICATE_OBSTACLE: 409,
 };
 
 /** Final error-formatting middleware. Must be registered last. */
@@ -49,12 +63,32 @@ function errorHandler(err, req, res, next) {
   } else if (err.name === 'RobotEngineError' && ROBOT_ENGINE_ERROR_STATUS[err.code]) {
     statusCode = ROBOT_ENGINE_ERROR_STATUS[err.code];
     message = err.message;
+  } else if (DOMAIN_TRANSITION_ERRORS.has(err.name)) {
+    // An illegal state move is a conflict with the resource's current
+    // state, not a malformed request - 409 rather than 400, and the same
+    // code the simulation engine reports for its own bad transitions.
+    statusCode = 409;
+    message = err.message;
+    details = { code: err.code, from: err.from, to: err.to };
+  } else if (JWT_ERRORS.has(err.name)) {
+    // Never surface jsonwebtoken's internals ("invalid signature",
+    // "jwt malformed") - they tell an attacker how close a forged token
+    // came, and they are of no use to a legitimate client.
+    statusCode = 401;
+    message = 'Not authenticated';
+    details = undefined;
   }
 
   const isProduction = process.env.NODE_ENV === 'production';
 
   if (statusCode >= 500) {
     console.error(err);
+    if (isProduction) {
+      // A 500 message can carry a driver error, a query fragment, or a
+      // file path. Log the real thing; tell the client nothing.
+      message = 'Internal Server Error';
+      details = undefined;
+    }
   }
 
   res.status(statusCode).json({
@@ -62,7 +96,9 @@ function errorHandler(err, req, res, next) {
     error: {
       message,
       ...(details ? { details } : {}),
-      ...(isProduction ? {} : { stack: err.stack }),
+      // Stack traces map the server's filesystem and dependency versions.
+      // Development only, and never for an authentication failure.
+      ...(isProduction || statusCode === 401 ? {} : { stack: err.stack }),
     },
   });
 }

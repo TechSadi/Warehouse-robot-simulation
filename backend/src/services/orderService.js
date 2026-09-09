@@ -5,7 +5,9 @@ const { generateRandomOrders } = require('../engine/orders/orderGenerator');
 const { planAssignments } = require('../engine/scheduling/strategies');
 const { warehouseToGrid } = require('../engine/grid/warehouseGrid');
 const { LOW_BATTERY_THRESHOLD } = require('../engine/robots/robotEngine')
+const { predecessorsOf, IN_FLIGHT_STATUSES } = require('../domain/orderLifecycle');
 const simulationManager = require('./simulationManager');
+const warehouseLock = require('./warehouseLock');
 const { ApiError } = require('../middleware/errorHandler');
 const simulationEvents = require('../events/simulationEvents');
 
@@ -39,8 +41,22 @@ async function generateOrders(warehouseId, count) {
  * whichever of the 5 named strategies (Milestone 7) this warehouse is
  * currently configured for (`Warehouse.schedulingStrategy`, switchable via
  * the existing PUT /api/warehouses/:id endpoint).
+ *
+ * Public entry point: takes the warehouse lock. Dispatch reads the pending
+ * orders from Mongo and *then* mutates the engine, with an await in
+ * between - so a dispatch racing a tick used to plan against a fleet whose
+ * positions and statuses changed underneath it, and could hand an order to
+ * a robot the tick had already sent somewhere else.
+ *
+ * `dispatchPendingOrdersLocked` is the same work without the lock, for the
+ * one caller that already holds it (tickRunner, which dispatches at the end
+ * of every tick). Re-entering the lock from there would deadlock.
  */
-async function dispatchPendingOrders(warehouseId) {
+function dispatchPendingOrders(warehouseId) {
+  return warehouseLock.runExclusive(warehouseId, () => dispatchPendingOrdersLocked(warehouseId));
+}
+
+async function dispatchPendingOrdersLocked(warehouseId) {
   const engine = await simulationManager.getEngine(warehouseId);
   const coordinator = await simulationManager.getOrderCoordinator(warehouseId);
   if (!engine || !coordinator) throw new ApiError(404, 'Warehouse not found');
@@ -91,13 +107,18 @@ async function dispatchPendingOrders(warehouseId) {
       deliveryLocation: order.deliveryLocation,
     });
 
-    if (!success) continue; // pickup unreachable right now - leave it pending, retry on a later pass
+    if (!success) continue; // not startable right now - leave it pending, retry on a later pass
 
     assignments.push({ orderId, robotId });
     updatedSnapshots.push(snapshot);
     orderUpdates.push({
       updateOne: {
-        filter: { _id: orderId },
+        // The status term makes this the same transition check the REST
+        // API performs, applied atomically: if the order stopped being
+        // dispatchable between the read above and this write (cancelled
+        // from the UI, or assigned by a concurrent dispatch), the filter
+        // matches nothing instead of overwriting a later state.
+        filter: { _id: orderId, status: { $in: predecessorsOf('assigned') } },
         update: { status: 'assigned', assignedRobot: robotId, assignedAt: new Date() },
       },
     });
@@ -137,11 +158,21 @@ async function processTickEvents(warehouseId, events) {
   for (const event of events) {
     if (event.type === 'picked_up') {
       orderUpdates.push({
-        updateOne: { filter: { _id: event.orderId }, update: { status: 'picked_up', pickedUpAt: new Date() } },
+        updateOne: {
+          // Same lifecycle gate as the REST API (domain/orderLifecycle.js),
+          // expressed as a filter so it holds atomically: an order the
+          // client cancelled mid-leg is not silently resurrected into
+          // `picked_up` by a tick that was already in flight.
+          filter: { _id: event.orderId, status: { $in: predecessorsOf('picked_up') } },
+          update: { status: 'picked_up', pickedUpAt: new Date() },
+        },
       });
     } else if (event.type === 'delivered') {
       orderUpdates.push({
-        updateOne: { filter: { _id: event.orderId }, update: { status: 'delivered', deliveredAt: new Date() } },
+        updateOne: {
+          filter: { _id: event.orderId, status: { $in: predecessorsOf('delivered') } },
+          update: { status: 'delivered', deliveredAt: new Date() },
+        },
       });
       const counts = schedulerState.completedCounts;
       counts.set(event.robotId, (counts.get(event.robotId) || 0) + 1);
@@ -151,11 +182,46 @@ async function processTickEvents(warehouseId, events) {
         message: `Order ${event.orderId} delivered by robot ${event.robotId}`,
         timestamp: new Date().toISOString(),
       });
+    } else if (event.type === 'order_failed') {
+      // The robot carrying this order broke down (flat battery, marked
+      // broken, destination cut off). The coordinator has already released
+      // it; this returns the order to the dispatchable pool so a healthy
+      // robot can take it, instead of leaving it pinned to a robot that
+      // cannot finish it. The filter is the same lifecycle gate the REST
+      // API applies, so an order cancelled in the meantime is not revived.
+      orderUpdates.push({
+        updateOne: {
+          filter: { _id: event.orderId, status: { $in: IN_FLIGHT_STATUSES } },
+          update: { status: 'pending', assignedRobot: null, assignedAt: null, pickedUpAt: null },
+        },
+      });
+      await Log.create({
+        level: 'warn',
+        source: 'order-service',
+        message: `Order ${event.orderId} released back to pending: robot ${event.robotId} failed (${event.reason})`,
+        warehouseId,
+      });
+      simulationEvents.emit('notification', {
+        warehouseId: key,
+        level: 'warn',
+        message: `Order ${event.orderId} returned to the queue: ${event.reason}`,
+        timestamp: new Date().toISOString(),
+      });
     } else if (event.type === 'delivery_unreachable') {
+      // Same release as `order_failed`: the coordinator has dropped the
+      // assignment, so without this the order would sit in an in-flight
+      // state with no robot working it and no path back to `pending`.
+      orderUpdates.push({
+        updateOne: {
+          filter: { _id: event.orderId, status: { $in: IN_FLIGHT_STATUSES } },
+          update: { status: 'pending', assignedRobot: null, assignedAt: null, pickedUpAt: null },
+        },
+      });
       await Log.create({
         level: 'warn',
         source: 'order-service',
         message: `Order ${event.orderId}: delivery location unreachable for robot ${event.robotId}`,
+        warehouseId,
       });
       simulationEvents.emit('notification', {
         warehouseId: key,
@@ -180,10 +246,71 @@ async function processTickEvents(warehouseId, events) {
     await Order.bulkWrite(orderUpdates, { ordered: true });
   }
 
-  const notable = events.filter((e) => e.type === 'picked_up' || e.type === 'delivered');
+  const notable = events.filter(
+    (e) => e.type === 'picked_up' || e.type === 'delivered' || e.type === 'order_failed'
+  );
   if (notable.length > 0) {
     simulationEvents.emit('orders:changed', { warehouseId: key, reason: 'tick', events: notable });
   }
 }
 
-module.exports = { generateOrders, dispatchPendingOrders, processTickEvents };
+/**
+ * Releases whatever runtime claim a warehouse's simulation has on these
+ * orders, and returns them to `pending` in Mongo.
+ *
+ * This is the path used when the *order side* changes underneath a running
+ * simulation - a robot working the order is deleted, or an order is
+ * cancelled or deleted from the API. Without it, the coordinator kept
+ * driving a robot toward a delivery point for an order that no longer
+ * existed (or was cancelled), and the order document kept naming a robot
+ * that was gone.
+ *
+ * `restoreToPending: false` is for orders whose document is being removed
+ * or cancelled outright - there is nothing to return to the pool, only a
+ * runtime claim to drop.
+ */
+async function releaseOrders(warehouseId, orderIds, { restoreToPending = true } = {}) {
+  const ids = (orderIds || []).filter(Boolean).map(String);
+  if (ids.length === 0) return [];
+
+  const coordinator = simulationManager.hasEngine(warehouseId)
+    ? await simulationManager.getOrderCoordinator(warehouseId)
+    : null;
+  if (coordinator) {
+    for (const orderId of ids) coordinator.releaseOrder(orderId);
+  }
+
+  if (restoreToPending) {
+    await Order.updateMany(
+      { _id: { $in: ids }, warehouseId, status: { $in: IN_FLIGHT_STATUSES } },
+      { $set: { status: 'pending', assignedRobot: null, assignedAt: null, pickedUpAt: null } }
+    );
+    simulationEvents.emit('orders:changed', { warehouseId: String(warehouseId), reason: 'released' });
+  }
+
+  return ids;
+}
+
+/** Releases every order a given robot is working - both the coordinator's
+ * runtime assignment and any order document still pointing at it. Called
+ * when a robot is deleted while a simulation is running. */
+async function releaseOrdersForRobot(warehouseId, robotId, releasedOrderIds = []) {
+  const stranded = await Order.find({
+    warehouseId,
+    assignedRobot: robotId,
+    status: { $in: IN_FLIGHT_STATUSES },
+  }).select('_id');
+
+  const ids = new Set(releasedOrderIds.map(String));
+  for (const doc of stranded) ids.add(String(doc._id));
+  return releaseOrders(warehouseId, [...ids]);
+}
+
+module.exports = {
+  generateOrders,
+  dispatchPendingOrders,
+  dispatchPendingOrdersLocked,
+  processTickEvents,
+  releaseOrders,
+  releaseOrdersForRobot,
+};
