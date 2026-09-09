@@ -338,7 +338,23 @@ describe('useLiveSimulation', () => {
       expect(realtime.emit).toHaveBeenCalledWith('simulation:start', {
         warehouseId: WAREHOUSE,
         deltaSeconds: 0.5,
+        // A simulation is normally a thing being watched, and stops when
+        // the last watcher leaves. Starting one is not, by default, asking
+        // for a background job.
+        background: false,
       });
+    });
+
+    it('asks the server to keep running unattended when that is what was chosen', async () => {
+      const { result } = renderHook(() => useLiveSimulation(WAREHOUSE, GRID));
+      await waitFor(() => expect(result.current.phase).toBe(SIMULATION_PHASE.READY));
+
+      act(() => result.current.startSimulation({ background: true }));
+
+      expect(realtime.emit).toHaveBeenCalledWith(
+        'simulation:start',
+        expect.objectContaining({ background: true })
+      );
     });
 
     it('surfaces a server-refused socket command and undoes the optimistic start', async () => {

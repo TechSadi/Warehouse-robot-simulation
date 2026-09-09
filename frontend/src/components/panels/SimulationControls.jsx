@@ -31,6 +31,8 @@ export default function SimulationControls({
   pendingAction,
   onStartSimulation,
   onStopSimulation,
+  runInBackground,
+  onToggleRunInBackground,
   onSpawnRobot,
   onGenerateOrders,
   onDispatchNow,
@@ -42,6 +44,7 @@ export default function SimulationControls({
 }) {
   const headingId = useId();
   const heatmapId = useId();
+  const backgroundId = useId();
   const realtime = describeRealtime(connection);
 
   if (!syncedWarehouseId) {
@@ -162,6 +165,31 @@ export default function SimulationControls({
       </div>
 
       <div className="control-row" role="group" aria-label="Run control">
+        {/*
+          A simulation normally stops when the last person watching it
+          closes their tab - it is a thing being watched, not a background
+          job. This is the opt-out, for the cases where it genuinely is
+          one: a long soak, a demo left running, a fleet being observed
+          from somewhere other than a browser. The server puts a ceiling on
+          how long an unattended run lasts, so a forgotten tab cannot tick
+          a warehouse for the life of the process.
+        */}
+        <label className="panel__checkbox" htmlFor={backgroundId}>
+          <input
+            id={backgroundId}
+            type="checkbox"
+            checked={Boolean(runInBackground)}
+            onChange={(e) => onToggleRunInBackground?.(e.target.checked)}
+            // Only meaningful at the moment of starting: flipping it while
+            // a loop is already running would suggest it changes that
+            // loop, which it does not.
+            disabled={isRunning || !canControl}
+          />
+          Keep running when nobody is watching
+        </label>
+      </div>
+
+      <div className="control-row" role="group" aria-label="Run control">
         {isRunning ? (
           <button
             type="button"
@@ -176,7 +204,7 @@ export default function SimulationControls({
           <button
             type="button"
             className="panel__button panel__button--primary"
-            onClick={onStartSimulation}
+            onClick={() => onStartSimulation({ background: Boolean(runInBackground) })}
             disabled={!canControl}
             title={controlsDisabledReason || undefined}
           >

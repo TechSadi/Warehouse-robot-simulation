@@ -1,4 +1,5 @@
 import { Component } from 'react';
+import { reportError } from '../../api/telemetry.js';
 import './ErrorBoundary.css';
 
 /**
@@ -11,9 +12,15 @@ import './ErrorBoundary.css';
  * whose shape this client does not control, and a single unexpected null
  * from a partially-applied update would do it.
  *
- * Deliberately not a place to report errors to a service - there is no
- * telemetry backend in this project, and inventing one here would be
- * scope no one asked for. It logs to the console and gets out of the way.
+ * It now also reports. This used to say, honestly, that there was no
+ * telemetry backend and inventing one would be scope nobody asked for -
+ * which was right that a vendor SDK does not belong here, and wrong that
+ * the alternative was the console. A render error in a deployed build that
+ * only reaches `console.error` is invisible unless a user thinks to
+ * mention it. The report goes to this project's own API and becomes a log
+ * line the user can already read in the Logs panel; nothing leaves the
+ * deployment. See api/telemetry.js for why it can never throw, retry, or
+ * fire more than once for the same failure.
  */
 export default class ErrorBoundary extends Component {
   constructor(props) {
@@ -27,7 +34,13 @@ export default class ErrorBoundary extends Component {
   }
 
   componentDidCatch(error, info) {
+    // The console line stays: it is what a developer with the tab open
+    // actually reads, and it works when the report does not.
     console.error(`[${this.props.label || 'app'}] render failed:`, error, info?.componentStack);
+    reportError(error, {
+      boundary: this.props.label || 'app',
+      componentStack: info?.componentStack,
+    });
   }
 
   handleReset() {

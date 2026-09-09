@@ -94,6 +94,11 @@ export default function AppShell({ apiHealth, onRecheckApi, realtimeState }) {
   const canvasRef = useRef(null);
   const [zoomPercent, setZoomPercent] = useState(1);
   const [showHeatmap, setShowHeatmap] = useState(false);
+  // Whether the *next* start should keep the simulation running after the
+  // last watcher leaves. Client state, not server state: it describes an
+  // intention about a command not yet sent, and the server's
+  // `simulation:status` reports what a running loop actually is.
+  const [runInBackground, setRunInBackground] = useState(false);
   const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
 
   const isPaintTool = activeTool !== TOOLS.SELECT;
@@ -230,6 +235,8 @@ export default function AppShell({ apiHealth, onRecheckApi, realtimeState }) {
               pendingAction={simulation.pendingAction}
               onStartSimulation={simulation.startSimulation}
               onStopSimulation={simulation.stopSimulation}
+              runInBackground={runInBackground}
+              onToggleRunInBackground={setRunInBackground}
               onSpawnRobot={simulation.spawnRandomRobot}
               onGenerateOrders={simulation.generateOrders}
               onDispatchNow={simulation.dispatchNow}

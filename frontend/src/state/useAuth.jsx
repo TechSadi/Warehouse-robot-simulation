@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import * as api from '../api/client.js';
 import { realtime } from '../api/realtime.js';
+import { setTelemetryEnabled } from '../api/telemetry.js';
 
 /**
  * Session state for the whole app.
@@ -37,11 +38,15 @@ export function AuthProvider({ children }) {
   const applySession = useCallback((nextUser) => {
     setUser(nextUser);
     setStatus(nextUser ? AUTH_STATUS.AUTHENTICATED : AUTH_STATUS.ANONYMOUS);
+    // Client error reports go to an authenticated endpoint, so there is no
+    // point firing them from a sign-in screen - see api/telemetry.js.
+    setTelemetryEnabled(Boolean(nextUser));
   }, []);
 
   const endSession = useCallback(() => {
     setUser(null);
     setStatus(AUTH_STATUS.ANONYMOUS);
+    setTelemetryEnabled(false);
     realtime.disconnect();
   }, []);
 
