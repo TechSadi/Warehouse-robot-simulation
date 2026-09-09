@@ -268,7 +268,15 @@ describe('simulation:start / simulation:stop', () => {
 
     await wait(200); // a few tick intervals at 60ms
     expect(runAutoTick.mock.calls.length).toBeGreaterThanOrEqual(2);
-    expect(runAutoTick).toHaveBeenCalledWith(WAREHOUSE_A, 0.06);
+    // The step is measured elapsed time rather than the nominal delta, so
+    // it tracks the requested cadence without ever being exactly it - a
+    // late interval advances the world by how late it was. Asserting the
+    // exact value would be asserting that the host was never busy.
+    for (const [warehouseId, delta] of runAutoTick.mock.calls) {
+      expect(warehouseId).toBe(WAREHOUSE_A);
+      expect(delta).toBeGreaterThanOrEqual(0.06);
+      expect(delta).toBeLessThan(0.5);
+    }
 
     const statusOff = nextEvent(client, 'simulation:status');
     client.emit('simulation:stop', { warehouseId: WAREHOUSE_A });

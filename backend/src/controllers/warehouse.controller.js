@@ -245,13 +245,23 @@ const dispatchOrders = asyncHandler(async (req, res) => {
   res.json({ success: true, data: { assignments, count: assignments.length } });
 });
 
-// Dynamic obstacles (Milestone 9) live only in the live engine's memory,
-// same as the robot task queue - see the note on Robot.taskQueue. They're
-// runtime simulation state, not part of the warehouse's saved layout.
+/**
+ * Dynamic obstacles (Milestone 9) are runtime simulation state rather than
+ * part of the warehouse's saved *layout* - but they are persisted now (see
+ * models/Warehouse.js), so they survive a restart, a layout edit and an
+ * engine-cache eviction instead of silently vanishing from under the
+ * robots routing around them.
+ *
+ * Read through `readObstacles`, which returns the live set when an engine
+ * happens to be loaded and the stored set otherwise. Deliberately *not*
+ * `getEngine`: building an engine reconciles the persisted fleet against
+ * what it could actually load, and that writes - so listing a warehouse's
+ * obstacles used to be a `GET` that quietly performed a recovery pass.
+ */
 const listObstacles = asyncHandler(async (req, res) => {
-  const engine = await simulationManager.getEngine(req.warehouse._id);
-  if (!engine) throw new ApiError(404, 'Warehouse not found');
-  res.json({ success: true, data: engine.getObstacles() });
+  const obstacles = await simulationManager.readObstacles(req.warehouse._id);
+  if (!obstacles) throw new ApiError(404, 'Warehouse not found');
+  res.json({ success: true, data: obstacles });
 });
 
 function broadcastObstacles(warehouseId, engine) {
@@ -276,7 +286,12 @@ const addObstacle = asyncHandler(async (req, res) => {
   const { obstacle, engine } = await warehouseLock.runExclusive(warehouse._id, async () => {
     const live = await simulationManager.getEngine(warehouse._id);
     if (!live) throw new ApiError(404, 'Warehouse not found');
-    return { obstacle: live.addObstacle(payload), engine: live };
+    const created = live.addObstacle(payload);
+    // Inside the lock, so the stored set can never be written from a
+    // half-applied engine state - and before the response, so a client
+    // that reads back immediately sees what it just created.
+    await simulationManager.persistObstacles(warehouse._id, live);
+    return { obstacle: created, engine: live };
   });
   broadcastObstacles(warehouse._id, engine);
   res.status(201).json({ success: true, data: obstacle });
@@ -287,6 +302,7 @@ const removeObstacle = asyncHandler(async (req, res) => {
     const live = await simulationManager.getEngine(req.warehouse._id);
     if (!live) throw new ApiError(404, 'Warehouse not found');
     if (!live.removeObstacle(req.params.obstacleId)) throw new ApiError(404, 'Obstacle not found');
+    await simulationManager.persistObstacles(req.warehouse._id, live);
     return live;
   });
   broadcastObstacles(req.warehouse._id, engine);

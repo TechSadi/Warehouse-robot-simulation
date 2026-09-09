@@ -63,6 +63,24 @@ function optionalDeltaSeconds(payload, { min = 0.001, max = 10 } = {}) {
   return value;
 }
 
+/**
+ * Whether a simulation should keep running once nobody is watching it.
+ *
+ * Strict about the type rather than truthiness-coercing: `background` is
+ * the difference between a loop that stops when the last tab closes and
+ * one that keeps a warehouse ticking, so a client sending `"false"` (a
+ * string, and therefore truthy) must be told it made a mistake rather than
+ * quietly getting the opposite of what it asked for.
+ */
+function optionalBoolean(payload, field) {
+  const value = asObject(payload)[field];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new SocketValidationError(`${field} must be a boolean`);
+  }
+  return value;
+}
+
 function optionalCount(payload, { min = 1, max = 100 } = {}) {
   const value = asObject(payload).count;
   if (value === undefined || value === null) return undefined;
@@ -78,5 +96,6 @@ module.exports = {
   asObject,
   requireWarehouseId,
   optionalDeltaSeconds,
+  optionalBoolean,
   optionalCount,
 };

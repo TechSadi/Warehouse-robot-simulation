@@ -21,6 +21,8 @@ jest.mock('../src/services/simulationManager', () => ({
   persistRobot: jest.fn(),
   persistRobots: jest.fn(),
   invalidate: jest.fn(),
+  persistObstacles: jest.fn(),
+  readObstacles: jest.fn(),
 }));
 
 jest.mock('../src/services/orderService', () => ({
@@ -75,6 +77,8 @@ beforeEach(() => {
   Robot.findById.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
   simulationManager.persistRobot.mockResolvedValue();
   simulationManager.persistRobots.mockResolvedValue();
+  simulationManager.persistObstacles.mockResolvedValue();
+  simulationManager.readObstacles.mockResolvedValue([]);
   orderService.processTickEvents.mockResolvedValue();
   orderService.dispatchPendingOrders.mockResolvedValue([]);
   orderService.dispatchPendingOrdersLocked.mockResolvedValue([]);

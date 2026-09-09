@@ -8,6 +8,7 @@ const {
   SocketValidationError,
   requireWarehouseId,
   optionalDeltaSeconds,
+  optionalBoolean,
 } = require('./socketValidation');
 const { findOwnedWarehouse } = require('../middleware/authorize');
 const simulationManager = require('../services/simulationManager');
@@ -148,6 +149,11 @@ function initSockets(httpServer) {
      * `orders:changed` in events/simulationEvents.js), and `reason: 'sync'`
      * below is what tells the client to do that. */
     async function buildSync(warehouseId) {
+      // This one does load an engine, unlike the REST read paths: a sync
+      // exists to report sub-tick-accurate robot positions, and those only
+      // exist in the engine. Joining a warehouse is the point at which
+      // somebody is about to simulate it anyway, so the reconciliation a
+      // load performs is work that was going to happen regardless.
       const engine = await simulationManager.getEngine(warehouseId);
       return {
         warehouseId,
@@ -188,7 +194,13 @@ function initSockets(httpServer) {
     // request that was dropped.
     guarded('simulation:start', ({ warehouseId, payload }) => {
       const deltaSeconds = optionalDeltaSeconds(payload);
-      const { started } = tickLoopManager.start(io, warehouseId, deltaSeconds);
+      // Opt-in to running with nobody watching. Off by default, because
+      // the default reading of "start" is "start, while I watch" - and a
+      // simulation nobody is watching still costs a tick loop, an engine
+      // pinned in the cache, and a stream of writes. See
+      // tickLoopManager.stopIfIdle.
+      const background = optionalBoolean(payload, 'background') ?? false;
+      const { started } = tickLoopManager.start(io, warehouseId, deltaSeconds, { background });
       socket.emit('simulation:status', { ...tickLoopManager.status(warehouseId), changed: started });
     });
 

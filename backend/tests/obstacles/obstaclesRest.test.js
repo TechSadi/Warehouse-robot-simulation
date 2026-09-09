@@ -19,6 +19,12 @@ jest.mock('../../src/services/simulationManager', () => ({
   getOrderCoordinator: jest.fn(),
   persistRobot: jest.fn(),
   invalidate: jest.fn(),
+  // Obstacles are persisted on the warehouse document now, so the write
+  // path calls persistObstacles and the read path calls readObstacles -
+  // the latter deliberately *not* getEngine, because building an engine
+  // reconciles the fleet, which writes.
+  persistObstacles: jest.fn(),
+  readObstacles: jest.fn(),
 }));
 
 // Ownership is resolved through the warehouse on every route below - see
@@ -54,12 +60,14 @@ beforeEach(() => {
   });
   Robot.findById.mockResolvedValue({ _id: VALID_ID, warehouseId: WAREHOUSE_ID });
   simulationManager.persistRobot.mockResolvedValue();
+  simulationManager.persistObstacles.mockResolvedValue();
+  simulationManager.readObstacles.mockResolvedValue([]);
 });
 
 describe('GET /api/warehouses/:id/obstacles', () => {
   it('lists active obstacles', () => {
     const obstacles = [{ id: 'o1', type: 'human_worker', cells: [{ x: 1, y: 1 }] }];
-    simulationManager.getEngine.mockResolvedValue(fakeEngine({ getObstacles: jest.fn().mockReturnValue(obstacles) }));
+    simulationManager.readObstacles.mockResolvedValue(obstacles);
 
     return authed(request(app).get(`/api/warehouses/${WAREHOUSE_ID}/obstacles`)).then((res) => {
       expect(res.status).toBe(200);
@@ -67,8 +75,18 @@ describe('GET /api/warehouses/:id/obstacles', () => {
     });
   });
 
+  it('does not build (and so does not reconcile) an engine just to read', async () => {
+    // Listing obstacles used to go through getEngine, which on a cache
+    // miss loads the fleet and writes back every disagreement it finds -
+    // a recovery pass triggered by a GET. The read path must not do that.
+    simulationManager.readObstacles.mockResolvedValue([]);
+    const res = await authed(request(app).get(`/api/warehouses/${WAREHOUSE_ID}/obstacles`));
+    expect(res.status).toBe(200);
+    expect(simulationManager.getEngine).not.toHaveBeenCalled();
+  });
+
   it('returns 404 when the warehouse does not exist', async () => {
-    simulationManager.getEngine.mockResolvedValue(null);
+    simulationManager.readObstacles.mockResolvedValue(null);
     const res = await authed(request(app).get(`/api/warehouses/${WAREHOUSE_ID}/obstacles`));
     expect(res.status).toBe(404);
   });

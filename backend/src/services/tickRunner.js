@@ -107,6 +107,28 @@ async function runTickLocked(warehouseId, deltaSeconds) {
     })
   );
 
+  // Robots maintenance retrieved this tick, because their battery reached
+  // zero away from a charging station - the one fault a robot cannot work
+  // its way out of (see RobotEngine._recoverStranded). Reported as loudly
+  // as the fault itself: a fleet that quietly repairs itself is a fleet
+  // whose operator never finds out their charging stations are in the
+  // wrong place.
+  const recoveries = typeof engine.takeRecoveries === 'function' ? engine.takeRecoveries() : [];
+  await Promise.all(
+    recoveries.map(async ({ robotId, from, to }) => {
+      const message =
+        `Robot ${robotId} was recovered by maintenance from (${from.x}, ${from.y}) ` +
+        `to the charging station at (${to.x}, ${to.y}) after its battery ran flat`;
+      await Log.create({ level: 'warn', source: 'robot-engine', message, warehouseId });
+      simulationEvents.emit('notification', {
+        warehouseId: key,
+        level: 'warn',
+        message,
+        timestamp: new Date().toISOString(),
+      });
+    })
+  );
+
   // orderService.dispatchPendingOrdersLocked emits its own 'orders:changed'
   // when it actually assigns something - see services/orderService.js.
   const dispatched = await orderService.dispatchPendingOrdersLocked(warehouseId);
@@ -115,6 +137,11 @@ async function runTickLocked(warehouseId, deltaSeconds) {
   const serialized = JSON.stringify(obstacles);
   if (lastObstacleSnapshot.get(key) !== serialized) {
     lastObstacleSnapshot.set(key, serialized);
+    // The set changes during a tick only when a timed hazard expires, so
+    // this write is rare - which is the whole reason the comparison above
+    // exists. Persisting here is what stops an expired hazard coming back
+    // to life on the next engine load. Already inside the warehouse lock.
+    await simulationManager.persistObstacles(warehouseId, engine);
     simulationEvents.emit('obstacles:changed', { warehouseId: key, obstacles });
   }
 

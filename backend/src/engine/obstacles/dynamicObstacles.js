@@ -49,6 +49,37 @@ class DynamicObstacleManager {
     return this.obstacles.delete(id);
   }
 
+  /**
+   * Replaces the whole set from persisted state, at engine construction
+   * time (services/simulationManager.js).
+   *
+   * Separate from `add` because it restores a hazard *mid-life*: `add`
+   * takes the duration a hazard was created with, while this takes the
+   * time actually left on it. Anything already expired is dropped rather
+   * than resurrected with a non-positive clock, and anything malformed is
+   * skipped rather than throwing - a stored document that no longer
+   * validates must not be able to stop a warehouse from loading.
+   */
+  restore(obstacles = []) {
+    this.obstacles.clear();
+    for (const stored of obstacles) {
+      if (!stored?.id || !OBSTACLE_TYPES.includes(stored.type)) continue;
+      if (!Array.isArray(stored.cells) || stored.cells.length === 0) continue;
+      const remainingSeconds =
+        stored.remainingSeconds === null || stored.remainingSeconds === undefined
+          ? null
+          : Number(stored.remainingSeconds);
+      if (remainingSeconds !== null && !(remainingSeconds > 0)) continue;
+      this.obstacles.set(stored.id, {
+        id: stored.id,
+        type: stored.type,
+        cells: cloneCells(stored.cells),
+        remainingSeconds,
+      });
+    }
+    return this.getAll();
+  }
+
   get(id) {
     const obstacle = this.obstacles.get(id);
     return obstacle ? this._snapshot(obstacle) : null;

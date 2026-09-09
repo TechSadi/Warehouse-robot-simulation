@@ -39,7 +39,21 @@ const TRANSITIONS = {
 
 /** Physical/simulation-owned fields. Never client-writable through a
  * generic CRUD route - see the DTO in robot.controller.js. */
-const SIMULATION_OWNED_FIELDS = ['position', 'rotation', 'battery', 'status', 'errorReason', 'taskQueue'];
+const SIMULATION_OWNED_FIELDS = [
+  'position',
+  'rotation',
+  'battery',
+  'status',
+  'errorReason',
+  // Both halves of the robot's work. These became real persisted
+  // fields when the engine started restoring a robot's route across a
+  // restart (see models/Robot.js), which is exactly when they also
+  // became worth protecting: writing a destination straight into Mongo
+  // would let a client route a robot without the engine's walkability,
+  // bounds or queue-depth checks ever running.
+  'currentTask',
+  'taskQueue',
+];
 
 class RobotTransitionError extends Error {
   constructor(from, to) {

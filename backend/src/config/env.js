@@ -70,6 +70,50 @@ const env = {
   isProduction,
   isTest,
 
+  // --- Simulation runtime ----------------------------------------------
+  simulation: {
+    /**
+     * Ceiling on how many warehouse engines stay cached in memory, and how
+     * long an unused one survives. The cache was previously unbounded in
+     * the number of warehouses ever touched since the process started -
+     * fine for a handful, a slow leak for a deployment with many. A
+     * warehouse that is actively ticking is pinned and never evicted, so
+     * these only govern warehouses nobody is running.
+     *
+     * Zero disables the corresponding half of the sweep.
+     */
+    maxCachedEngines: Number(process.env.MAX_CACHED_ENGINES) || 64,
+    engineIdleTtlMs: Number(process.env.ENGINE_IDLE_TTL_MS) || 30 * 60 * 1000,
+    /**
+     * How long a simulation may keep running with nobody watching it (see
+     * `background: true` on `simulation:start`). Unattended work needs a
+     * ceiling or a forgotten browser tab leaves a warehouse ticking for
+     * the life of the process.
+     */
+    maxBackgroundSeconds: Number(process.env.MAX_BACKGROUND_SECONDS) || 60 * 60,
+    /**
+     * The largest simulation step a single tick may apply. The automatic
+     * loop measures real elapsed time rather than assuming its own cadence
+     * (see sockets/tickLoopManager.js), so a stalled process would
+     * otherwise come back and advance the world by however long it was
+     * gone. Capping turns that into a bounded catch-up and a visible
+     * `laggedSeconds` counter instead of a teleporting fleet.
+     */
+    maxTickDeltaSeconds: Number(process.env.MAX_TICK_DELTA_SECONDS) || 2,
+    /**
+     * Cross-process warehouse leases. One Node process may own a
+     * warehouse's tick loop at a time; a second instance running against
+     * the same database refuses to tick a warehouse another instance
+     * holds, rather than running a second simulation of it. Off under test
+     * (there is no shared database to coordinate through) and off when
+     * explicitly disabled for a known single-instance deployment.
+     */
+    leasesEnabled: process.env.SIMULATION_LEASES
+      ? process.env.SIMULATION_LEASES === 'true'
+      : !isTest,
+    leaseTtlSeconds: Number(process.env.SIMULATION_LEASE_TTL_SECONDS) || 30,
+  },
+
   // --- Authentication -------------------------------------------------
   // Separate signing keys per token type: a stolen/leaked access secret
   // must not also let an attacker mint refresh tokens (and vice versa).
