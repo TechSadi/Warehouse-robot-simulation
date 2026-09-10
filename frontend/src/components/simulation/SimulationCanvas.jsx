@@ -7,15 +7,15 @@ const CORNERS = ['top-left', 'top-right', 'bottom-left', 'bottom-right'];
 
 /**
  * The floor plan, with the chrome around it that says what the picture
- * means: whether the simulation is running, whether what is drawn is
- * current, and what the pointer is over.
+ * means: whether what is drawn is current, and what the pointer is over.
  *
  * The canvas itself is a picture and stays one - a per-cell DOM tree for a
  * 6400-cell grid would be far worse for everyone, including screen-reader
  * users. What it gets instead is a text summary of the fleet next to it
- * (the roster in the sidebar is the accessible view of the same data) and
- * an explicit "running"/"stale" badge, so the two states that were
- * previously distinguishable only by watching pixels move now say so.
+ * (the roster in the sidebar is the accessible view of the same data),
+ * which also states whether the simulation is running, and an explicit
+ * "stale" badge for data that is no longer live - a state otherwise
+ * indistinguishable from a simulation that is simply standing still.
  */
 export default function SimulationCanvas({
   canvasRef,
@@ -58,12 +58,6 @@ export default function SimulationCanvas({
         </div>
 
         <div className="sim-canvas__badges">
-          {isRunning ? (
-            <span className="sim-canvas__badge sim-canvas__badge--running">
-              <span className="sim-canvas__badge-dot" aria-hidden="true" />
-              Running
-            </span>
-          ) : null}
           {isStale ? (
             <span className="sim-canvas__badge sim-canvas__badge--stale">Not live — last known positions</span>
           ) : null}
