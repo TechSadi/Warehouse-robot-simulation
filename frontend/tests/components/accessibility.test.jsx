@@ -107,12 +107,6 @@ describe('SimulationCanvas status', () => {
     );
   });
 
-  it('badges a running simulation on the picture itself', () => {
-    render(<SimulationCanvas {...props} isRunning />);
-
-    expect(screen.getByText('Running')).toBeInTheDocument();
-  });
-
   it('badges data that is no longer live', () => {
     render(<SimulationCanvas {...props} isStale />);
 

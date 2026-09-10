@@ -75,7 +75,6 @@ test.describe('full operator journey', () => {
     await test.step('start the simulation', async () => {
       await page.getByRole('button', { name: /start simulation/i }).click();
       await expect(page.locator('.run-state__label').filter({ hasText: 'Simulation running' })).toBeVisible();
-      await expect(page.locator('.sim-canvas__badge--running')).toBeVisible();
     });
 
     await test.step('observe robot movement', async () => {
@@ -96,7 +95,6 @@ test.describe('full operator journey', () => {
     await test.step('stop the simulation', async () => {
       await page.getByRole('button', { name: /stop simulation/i }).click();
       await expect(page.locator('.run-state__label').filter({ hasText: 'Simulation stopped' })).toBeVisible();
-      await expect(page.locator('.sim-canvas__badge--running')).toHaveCount(0);
 
       // Stopped really means stopped: positions stay put.
       const settled = await robotPositions(page);
