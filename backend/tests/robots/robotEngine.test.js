@@ -556,7 +556,10 @@ describe('multi-robot coordination', () => {
     expect(b.isWaiting).toBe(true);
   });
 
-  it('a stationary idle robot blocks a moving robot just like a parked obstacle', () => {
+  it('an idle robot standing on another robot\'s destination steps aside for it', () => {
+    // Used to be a permanent block: no reroute can reach an occupied
+    // destination, so a robot parked on a dock stopped every later
+    // delivery there. See tests/robots/dockGridlock.test.js.
     const engine = new RobotEngine(makeGrid(5, 10));
     engine.spawnRobot({ id: 'parked', position: { x: 5, y: 2 } });
     engine.spawnRobot({ id: 'mover', position: { x: 3, y: 2 }, speed: 1000 });
@@ -564,11 +567,8 @@ describe('multi-robot coordination', () => {
 
     for (let i = 0; i < DEADLOCK_REROUTE_THRESHOLD + 1; i++) engine.tick(1);
 
-    // With row 2 blocked by 'parked' and no walls at all, the mover should
-    // have successfully routed around through another row rather than
-    // ever occupying (5,2).
-    const mover = engine.getRobot('mover');
-    expect(mover.position).not.toEqual({ x: 5, y: 2 });
+    expect(engine.getRobot('mover').position).toEqual({ x: 5, y: 2 });
+    expect(engine.getRobot('parked').position).not.toEqual({ x: 5, y: 2 });
   });
 });
 
