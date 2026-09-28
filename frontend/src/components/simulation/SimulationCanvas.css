@@ -6,6 +6,11 @@
 }
 
 .sim-canvas__frame {
+  /* Height of the strip under the grid that holds the readout pill. The
+     pill used to float over the canvas itself, where it covered the bottom
+     row of cells - typically the charging stations - whenever the grid
+     filled the frame. */
+  --readout-strip: 44px;
   position: relative;
   flex: 1;
   border: 1px solid var(--line-bright);
@@ -16,7 +21,7 @@
 
 .sim-canvas__frame > .grid-canvas {
   position: absolute;
-  inset: 0;
+  inset: 0 0 var(--readout-strip) 0;
 }
 
 /* Corner tick marks, like an engineering drawing's crop marks. This is the
@@ -65,7 +70,7 @@
   z-index: 2;
 }
 .sim-canvas__axis-label--x {
-  bottom: 16px;
+  bottom: calc((var(--readout-strip) - 11px) / 2);
   right: 40px;
 }
 .sim-canvas__axis-label--y {
@@ -75,13 +80,16 @@
 
 .sim-canvas__readout {
   position: absolute;
-  bottom: 14px;
+  /* Centred in the strip below the grid, never over it. */
+  bottom: calc((var(--readout-strip) - 28px) / 2);
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 14px;
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0 14px;
   border-radius: 999px;
   border: 1px solid var(--line-bright);
   background: rgba(18, 22, 27, 0.85);
@@ -152,6 +160,12 @@
 @media (max-width: 700px) {
   .sim-canvas {
     padding: 8px;
+  }
+
+  /* The readout only appears here for a selected cell, so keep just
+     enough strip for it. */
+  .sim-canvas__frame {
+    --readout-strip: 36px;
   }
 
   .sim-canvas__readout-hint {

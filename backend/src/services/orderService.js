@@ -10,6 +10,7 @@ const simulationManager = require('./simulationManager');
 const warehouseLock = require('./warehouseLock');
 const { ApiError } = require('../middleware/errorHandler');
 const simulationEvents = require('../events/simulationEvents');
+const { robotLabel, orderLabel, sentenceCase, shortId } = require('../utils/eventLabels');
 
 async function generateOrders(warehouseId, count) {
   const warehouse = await Warehouse.findById(warehouseId);
@@ -27,7 +28,7 @@ async function generateOrders(warehouseId, count) {
   await Log.create({
     level: 'info',
     source: 'order-service',
-    message: `Generated ${orders.length} order(s) for warehouse ${warehouseId}`,
+    message: `Generated ${orders.length} order(s) for ${warehouse.name ? `"${warehouse.name}"` : `warehouse #${shortId(warehouseId)}`}`,
     warehouseId,
   });
 
@@ -155,6 +156,40 @@ async function dispatchPendingOrdersLocked(warehouseId) {
   return assignments;
 }
 
+const EVENTS_WITH_MESSAGES = new Set(['delivered', 'order_failed', 'delivery_unreachable']);
+
+/**
+ * Looks up what processTickEvents' messages need to name robots and orders
+ * the way the dashboard does (see utils/eventLabels.js): robot names from
+ * the running engine, order routes in one query for just the orders that
+ * get a message this tick - which is none on most ticks. Any failure falls
+ * back to short ids; a label is never worth failing a tick over.
+ */
+async function labelsFor(warehouseId, events) {
+  const orderIds = [...new Set(events.filter((e) => EVENTS_WITH_MESSAGES.has(e.type)).map((e) => e.orderId))];
+  const orders = new Map();
+  let engine = null;
+
+  if (orderIds.length > 0) {
+    try {
+      engine = await simulationManager.peekEngine(warehouseId);
+    } catch {
+      engine = null;
+    }
+    try {
+      const docs = await Order.find({ _id: { $in: orderIds } }).select('pickupLocation deliveryLocation');
+      for (const doc of docs || []) orders.set(String(doc._id), doc);
+    } catch {
+      // Keep the fallback labels.
+    }
+  }
+
+  return {
+    robotName: (id) => robotLabel(engine?.getRobot(String(id))?.name, id),
+    order: (id) => orderLabel(orders.get(String(id)), id),
+  };
+}
+
 /** Persists the Order-side effects of OrderCoordinator.processTick()'s
  * events, and updates the per-robot completed-order counts the
  * least-busy scheduling strategy relies on. */
@@ -162,6 +197,7 @@ async function processTickEvents(warehouseId, events) {
   const schedulerState = simulationManager.getSchedulerState(warehouseId);
   const key = String(warehouseId);
   const orderUpdates = [];
+  const { robotName, order } = await labelsFor(warehouseId, events);
 
   for (const event of events) {
     if (event.type === 'picked_up') {
@@ -184,10 +220,15 @@ async function processTickEvents(warehouseId, events) {
       });
       const counts = schedulerState.completedCounts;
       counts.set(event.robotId, (counts.get(event.robotId) || 0) + 1);
+      const message = `${sentenceCase(robotName(event.robotId))} delivered ${order(event.orderId)}`;
+      // Persisted as well as broadcast, like every other notification here -
+      // deliveries used to be the one event that only ever reached the live
+      // feed, so the Logs panel showed nothing for a run that was working.
+      await Log.create({ level: 'info', source: 'order-service', message, warehouseId });
       simulationEvents.emit('notification', {
         warehouseId: key,
         level: 'info',
-        message: `Order ${event.orderId} delivered by robot ${event.robotId}`,
+        message,
         timestamp: new Date().toISOString(),
       });
     } else if (event.type === 'order_failed') {
@@ -206,13 +247,13 @@ async function processTickEvents(warehouseId, events) {
       await Log.create({
         level: 'warn',
         source: 'order-service',
-        message: `Order ${event.orderId} released back to pending: robot ${event.robotId} failed (${event.reason})`,
+        message: `${sentenceCase(order(event.orderId))} released back to pending: ${robotName(event.robotId)} failed (${event.reason})`,
         warehouseId,
       });
       simulationEvents.emit('notification', {
         warehouseId: key,
         level: 'warn',
-        message: `Order ${event.orderId} returned to the queue: ${event.reason}`,
+        message: `${sentenceCase(order(event.orderId))} returned to the queue: ${robotName(event.robotId)} failed (${event.reason})`,
         timestamp: new Date().toISOString(),
       });
     } else if (event.type === 'delivery_unreachable') {
@@ -228,13 +269,13 @@ async function processTickEvents(warehouseId, events) {
       await Log.create({
         level: 'warn',
         source: 'order-service',
-        message: `Order ${event.orderId}: delivery location unreachable for robot ${event.robotId}`,
+        message: `${sentenceCase(order(event.orderId))}: delivery location unreachable for ${robotName(event.robotId)}`,
         warehouseId,
       });
       simulationEvents.emit('notification', {
         warehouseId: key,
         level: 'warn',
-        message: `Order ${event.orderId}: delivery location unreachable`,
+        message: `${sentenceCase(order(event.orderId))}: delivery location unreachable`,
         timestamp: new Date().toISOString(),
       });
     }

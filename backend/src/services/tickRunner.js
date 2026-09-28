@@ -3,6 +3,7 @@ const orderService = require('./orderService');
 const warehouseLock = require('./warehouseLock');
 const Log = require('../models/Log');
 const simulationEvents = require('../events/simulationEvents');
+const { robotLabel, sentenceCase } = require('../utils/eventLabels');
 
 // Last obstacle list broadcast per warehouse, serialized for cheap
 // comparison. Obstacles only actually change when one is added/removed
@@ -96,7 +97,7 @@ async function runTickLocked(warehouseId, deltaSeconds) {
   const newlyErrored = changed.filter((r) => r.status === 'error');
   await Promise.all(
     newlyErrored.map(async (r) => {
-      const message = `Robot ${r.id} entered error state: ${r.errorReason}`;
+      const message = `${sentenceCase(robotLabel(r.name, r.id))} entered error state: ${r.errorReason}`;
       await Log.create({ level: 'warn', source: 'robot-engine', message, warehouseId });
       simulationEvents.emit('notification', {
         warehouseId: key,
@@ -117,7 +118,7 @@ async function runTickLocked(warehouseId, deltaSeconds) {
   await Promise.all(
     recoveries.map(async ({ robotId, from, to }) => {
       const message =
-        `Robot ${robotId} was recovered by maintenance from (${from.x}, ${from.y}) ` +
+        `${sentenceCase(robotLabel(engine.getRobot(robotId)?.name, robotId))} was recovered by maintenance from (${from.x}, ${from.y}) ` +
         `to the charging station at (${to.x}, ${to.y}) after its battery ran flat`;
       await Log.create({ level: 'warn', source: 'robot-engine', message, warehouseId });
       simulationEvents.emit('notification', {
