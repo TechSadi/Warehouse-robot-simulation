@@ -101,6 +101,71 @@ describe('idle robots yield the cell another robot needs', () => {
     expect(engine.getRobot('b')).toMatchObject({ status: STATUSES.IDLE, position: { x: 0, y: 0 }, taskQueue: [] });
   });
 
+  it('clears a robot boxed in by other idle robots, one neighbour at a time', () => {
+    // The target cell's robot has the courier on one side, the grid edge on
+    // another and idle robots on the rest, so it has nowhere to step. A
+    // grid without docks keeps the proactive dock clearing out of it - this
+    // is the chain alone.
+    const engine = new RobotEngine(makeGrid(6, 10));
+    engine.spawnRobot({ id: 'boxed', position: { x: 5, y: 0 } });
+    engine.spawnRobot({ id: 'right', position: { x: 6, y: 0 } });
+    engine.spawnRobot({ id: 'below', position: { x: 5, y: 1 } });
+    engine.spawnRobot({ id: 'courier', position: { x: 4, y: 0 } });
+    engine.assignTask('courier', { x: 5, y: 0 });
+
+    let arrivedAt = -1;
+    for (let i = 0; i < 40 && arrivedAt < 0; i++) {
+      for (const r of engine.tick(0.5)) {
+        if (r.id === 'courier' && r.status === STATUSES.IDLE && r.position.x === 5 && r.position.y === 0) arrivedAt = i;
+      }
+    }
+
+    expect(arrivedAt).toBeGreaterThanOrEqual(0);
+  });
+
+  it('delivers to a dock walled in by parked robots, as in the demo', () => {
+    // The demo's end state: a robot idle on the dock, idle robots on its
+    // other free sides and one more behind those, and the last courier
+    // arriving from the left. It used to back off and return indefinitely.
+    const engine = new RobotEngine(makeGrid(6, 12, { docks: [[6, 0]] }));
+    engine.spawnRobot({ id: 'onDock', position: { x: 6, y: 0 } });
+    engine.spawnRobot({ id: 'right', position: { x: 7, y: 0 } });
+    engine.spawnRobot({ id: 'below', position: { x: 6, y: 1 } });
+    engine.spawnRobot({ id: 'belowThat', position: { x: 6, y: 2 } });
+    engine.spawnRobot({ id: 'courier', position: { x: 1, y: 0 } });
+    engine.assignTask('courier', { x: 6, y: 0 });
+
+    let arrivedAt = -1;
+    for (let i = 0; i < 60 && arrivedAt < 0; i++) {
+      for (const r of engine.tick(0.5)) {
+        if (r.id === 'courier' && r.status === STATUSES.IDLE && r.position.x === 6 && r.position.y === 0) arrivedAt = i;
+      }
+    }
+
+    expect(arrivedAt).toBeGreaterThanOrEqual(0);
+  });
+
+  it('drives off the dock once a delivery is done, without being asked', () => {
+    const engine = new RobotEngine(makeGrid(6, 10, { docks: [[5, 0]] }));
+    engine.spawnRobot({ id: 'courier', position: { x: 5, y: 4 } });
+    engine.assignTask('courier', { x: 5, y: 0 });
+
+    // The tick it arrives it is reported idle on the dock - that is what
+    // the order coordinator counts as the delivery.
+    let reportedOnDock = false;
+    for (let i = 0; i < 20 && !reportedOnDock; i++) {
+      reportedOnDock = engine.tick(0.5).some((r) => r.status === STATUSES.IDLE && r.position.x === 5 && r.position.y === 0);
+    }
+    expect(reportedOnDock).toBe(true);
+
+    for (let i = 0; i < 20; i++) engine.tick(0.5);
+    const { position, status, taskQueue } = engine.getRobot('courier');
+    expect(status).toBe(STATUSES.IDLE);
+    expect(taskQueue).toEqual([]);
+    // Off the dock and the cells next to it.
+    expect(Math.abs(position.x - 5) + Math.abs(position.y - 0)).toBeGreaterThanOrEqual(2);
+  });
+
   it('leaves a robot that is busy alone', () => {
     const engine = new RobotEngine(makeGrid(3, 10));
     engine.spawnRobot({ id: 'broken', position: { x: 5, y: 1 } });
@@ -168,6 +233,14 @@ describe('fleet throughput with few docks', () => {
     // wherever they finished - usually on a dock.
     const { created, delivered } = runFleet({ seed, ordersPerTick: (t) => t % 40 === 0 });
     expect(delivered).toBeGreaterThanOrEqual(created - 5);
+  });
+
+  it.each([1, 2, 3, 7, 42, 99, 123, 2024])('delivers every order of a demo-sized run - two batches of 5 (seed %i)', (seed) => {
+    // The demo's last order used to be the one that never arrived: by then
+    // every robot had parked around the docks and one dock was walled in.
+    const { created, delivered } = runFleet({ seed, ordersPerTick: (t) => t === 0 || t === 10 });
+    expect(created).toBe(10);
+    expect(delivered).toBe(10);
   });
 
   it.each([1, 2, 3, 7, 42])('is still delivering at the end of a steady stream of orders (seed %i)', (seed) => {

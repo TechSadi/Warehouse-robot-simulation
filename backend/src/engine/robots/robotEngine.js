@@ -45,6 +45,9 @@ const STRANDED_RECOVERY_TICKS = 20;
 // aside into when it is standing where another robot needs to go. See
 // _yieldCell.
 const YIELD_SEARCH_RADIUS = 8;
+// How many robots deep a request to step aside may pass along when the
+// robot asked is boxed in by other idle robots - see _makeRoom.
+const YIELD_CHAIN_DEPTH = 3;
 const EPSILON = 1e-9;
 
 const ORTHOGONAL_STEPS = [
@@ -143,6 +146,7 @@ class RobotEngine {
     // (see the class doc comment above), so there's no need to rescan it
     // on every low-battery robot's every tick.
     this._chargingCells = this._scanChargingCells();
+    this._dockApron = this._scanDockApron();
     /** Retrievals performed since the last takeRecoveries() call, so the
      * caller can log and broadcast them - the engine itself has no I/O. */
     this._recoveries = [];
@@ -407,7 +411,7 @@ class RobotEngine {
         this._charge(robot, deltaSeconds);
         changed.push(this._snapshot(robot));
       } else if (robot.status === STATUSES.IDLE) {
-        if (this._maybeAutoCharge(robot)) changed.push(this._snapshot(robot));
+        if (this._maybeAutoCharge(robot) || this._maybeClearDock(robot)) changed.push(this._snapshot(robot));
       } else if (robot.status === STATUSES.ERROR) {
         if (this._recoverStranded(robot)) changed.push(this._snapshot(robot));
       }
@@ -643,6 +647,37 @@ class RobotEngine {
     return cells;
   }
 
+  /** Every walkable cell on or orthogonally next to a dock, as cellKey()s -
+   * the space a delivery needs kept open. Scanned once, like the charging
+   * cells. A grid with no notion of docks has no apron. */
+  _scanDockApron() {
+    const apron = new Set();
+    if (!this.grid.isDock) return apron;
+    for (let y = 0; y < this.grid.rows; y++) {
+      for (let x = 0; x < this.grid.cols; x++) {
+        if (!this.grid.isDock(x, y)) continue;
+        for (const { dx, dy } of [{ dx: 0, dy: 0 }, ...ORTHOGONAL_STEPS]) {
+          if (isWalkable(this.grid, x + dx, y + dy)) apron.add(cellKey({ x: x + dx, y: y + dy }));
+        }
+      }
+    }
+    return apron;
+  }
+
+  /** Called for every idle robot each tick. A robot with nothing to do that
+   * is standing on a dock, or right next to one, drives off to park on open
+   * floor. Otherwise robots that finish a delivery stay where they stopped,
+   * and after a few deliveries a dock is walled in by parked robots that
+   * cannot step aside for the next courier because each is blocking the
+   * others. The coordinator has already seen the robot arrive (it reacts to
+   * the tick the robot went idle), so leaving on a later tick loses nothing.
+   * Returns true if the robot is now moving. */
+  _maybeClearDock(robot) {
+    if (robot.taskQueue.length > 0 || robot.battery <= 0) return false;
+    if (!this._dockApron.has(cellKey(robot.currentCell))) return false;
+    return this._stepAside(robot, this._dockApron);
+  }
+
   /** Pops the next queued destination (if any) and computes a path to it.
    * Returns true if the robot is now moving. */
   _tryStartNextTask(robot) {
@@ -842,11 +877,41 @@ class RobotEngine {
   /** Moves an idle robot with nothing queued off the cell `forRobot`
    * needs. Only robots with nothing to do are moved: a charging, broken or
    * busy robot keeps its place, and the blocked robot falls back to
-   * waiting and rerouting as before. Returns true if the robot is now
-   * moving out of the way. */
+   * waiting and rerouting as before. Returns true if the robot is moving
+   * out of the way, or room is being made for it to - either way the
+   * blocked robot should wait rather than back off. */
   _yieldCell(robot, forRobot) {
-    if (robot.status !== STATUSES.IDLE || robot.taskQueue.length > 0 || robot.battery <= 0) return false;
-    return this._stepAside(robot, this._remainingRoute(forRobot));
+    return this._makeRoom(robot, this._remainingRoute(forRobot), YIELD_CHAIN_DEPTH);
+  }
+
+  _canYield(robot) {
+    return robot.status === STATUSES.IDLE && robot.taskQueue.length === 0 && robot.battery > 0;
+  }
+
+  /** Steps an idle robot aside to a cell outside `keepClear`. If it is boxed
+   * in by other idle robots - the dock walled in on three sides, with the
+   * courier on the fourth - one of those neighbours makes room first (and
+   * so on, up to `depth` robots deep), and this robot follows on a later
+   * tick once the cell is free. Without that, the courier's only fallback
+   * was to back off and come straight back, forever. */
+  _makeRoom(robot, keepClear, depth) {
+    if (!this._canYield(robot)) return false;
+    if (this._stepAside(robot, keepClear)) return true;
+    if (depth <= 0) return false;
+
+    const neighbours = [];
+    for (const { dx, dy } of ORTHOGONAL_STEPS) {
+      const cell = { x: robot.currentCell.x + dx, y: robot.currentCell.y + dy };
+      const occupant = this.robots.get(this._occupantOf(cell, robot.id));
+      if (occupant) neighbours.push(occupant);
+    }
+    // A neighbour already on its way out frees a cell once it gets there.
+    if (neighbours.some((n) => n.yielding)) return true;
+
+    // The neighbour must not settle on this robot's cell or anything the
+    // original requester still needs.
+    const clear = new Set(keepClear).add(cellKey(robot.currentCell));
+    return neighbours.some((n) => this._makeRoom(n, clear, depth - 1));
   }
 
   /** The cells still ahead on a robot's current path, as cellKey()s. */
