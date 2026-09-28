@@ -14,7 +14,7 @@ is preserved in [`docs/DEVELOPMENT_LOG.md`](./docs/DEVELOPMENT_LOG.md).
 
 ## Live Demo
 
-🔗 [Click here to view the live demo](https://warehouse-robot-simulation-b6uc.vercel.app/)
+🔗 [Click here to view the live demo](https://warehouse-robot-simulation.vercel.app/)
 
 [Demo]
 
