@@ -364,7 +364,7 @@ export default function AppShell({ apiHealth, onRecheckApi, realtimeState }) {
           </ErrorBoundary>
 
           <ErrorBoundary label="Logs">
-            <LogsPanel syncedWarehouseId={syncedWarehouseId} />
+            <LogsPanel syncedWarehouseId={syncedWarehouseId} isRunning={simulation.isRunning} />
           </ErrorBoundary>
 
           <ErrorBoundary label="The activity chart">

@@ -1,8 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import LayoutsPanel from '../../src/components/panels/LayoutsPanel.jsx';
-import LogsPanel from '../../src/components/panels/LogsPanel.jsx';
+import LogsPanel, { LIVE_REFRESH_MS } from '../../src/components/panels/LogsPanel.jsx';
 import { LAYOUTS_STATUS, SYNC_STATUS } from '../../src/state/useSimulationGrid.js';
 
 vi.mock('../../src/api/client.js', () => ({
@@ -219,5 +219,72 @@ describe('LogsPanel', () => {
     render(<LogsPanel syncedWarehouseId="w1" />);
 
     expect(await screen.findByText('error:')).toBeInTheDocument();
+  });
+
+  describe('while the simulation is running', () => {
+    const entry = (id, message) => ({ _id: id, level: 'info', message, source: 'order-service', createdAt: null });
+
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    async function tick() {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(LIVE_REFRESH_MS);
+      });
+    }
+
+    it('picks up new entries without anyone pressing Refresh', async () => {
+      api.listLogs.mockResolvedValueOnce({ data: [] });
+      render(<LogsPanel syncedWarehouseId="w1" isRunning />);
+      await screen.findByText(/no log entries yet/i);
+
+      api.listLogs.mockResolvedValue({ data: [entry('l1', 'Robot 3 delivered order (22,4) → (15,0)')] });
+      await tick();
+
+      expect(await screen.findByText(/robot 3 delivered order/i)).toBeInTheDocument();
+      // Silent: the Refresh button never flipped to its busy state.
+      expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
+    });
+
+    it('does not poll when the simulation is stopped', async () => {
+      api.listLogs.mockResolvedValue({ data: [] });
+      render(<LogsPanel syncedWarehouseId="w1" isRunning={false} />);
+      await screen.findByText(/no log entries yet/i);
+
+      await tick();
+      await tick();
+
+      expect(api.listLogs).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the list it has when a background reload fails', async () => {
+      api.listLogs.mockResolvedValueOnce({ data: [entry('l1', 'Generated 5 order(s)')] });
+      render(<LogsPanel syncedWarehouseId="w1" isRunning />);
+      await screen.findByText(/generated 5 order/i);
+
+      api.listLogs.mockRejectedValue(Object.assign(new Error('Request failed: 503'), { status: 503 }));
+      await tick();
+
+      expect(screen.getByText(/generated 5 order/i)).toBeInTheDocument();
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('reloads once more when the simulation stops', async () => {
+      api.listLogs.mockResolvedValue({ data: [] });
+      const { rerender } = render(<LogsPanel syncedWarehouseId="w1" isRunning />);
+      await screen.findByText(/no log entries yet/i);
+      const before = api.listLogs.mock.calls.length;
+
+      api.listLogs.mockResolvedValue({ data: [entry('l2', 'Robot 1 delivered order (1,1) → (4,0)')] });
+      rerender(<LogsPanel syncedWarehouseId="w1" isRunning={false} />);
+
+      expect(await screen.findByText(/robot 1 delivered order/i)).toBeInTheDocument();
+      expect(api.listLogs.mock.calls.length).toBe(before + 1);
+    });
   });
 });

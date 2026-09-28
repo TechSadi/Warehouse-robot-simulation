@@ -8,6 +8,7 @@ const simulationManager = require('../services/simulationManager');
 const warehouseLock = require('../services/warehouseLock');
 const orderService = require('../services/orderService');
 const simulationEvents = require('../events/simulationEvents');
+const { robotLabel, sentenceCase } = require('../utils/eventLabels');
 
 /**
  * Creation may set a robot's *initial* physical placement - that is what
@@ -251,7 +252,7 @@ const markBroken = asyncHandler(async (req, res) => {
   simulationEvents.emit('notification', {
     warehouseId: String(doc.warehouseId),
     level: 'warn',
-    message: `Robot ${doc._id} marked broken${reason ? `: ${reason}` : ''}`,
+    message: `${sentenceCase(robotLabel(doc.name, doc._id))} marked broken${reason ? `: ${reason}` : ''}`,
     timestamp: new Date().toISOString(),
   });
   res.json({ success: true, data: snapshot });
