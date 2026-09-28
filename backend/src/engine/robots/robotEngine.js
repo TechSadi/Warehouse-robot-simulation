@@ -41,7 +41,22 @@ const BATTERY_RESERVE_PERCENT = 5;
 // short enough that an unattended simulation does not slowly fill up with
 // permanent obstacles.
 const STRANDED_RECOVERY_TICKS = 20;
+// How far (in steps) an idle robot will look for a free cell to step
+// aside into when it is standing where another robot needs to go. See
+// _yieldCell.
+const YIELD_SEARCH_RADIUS = 8;
 const EPSILON = 1e-9;
+
+const ORTHOGONAL_STEPS = [
+  { dx: 0, dy: -1 },
+  { dx: 1, dy: 0 },
+  { dx: 0, dy: 1 },
+  { dx: -1, dy: 0 },
+];
+
+function cellKey(cell) {
+  return `${cell.x}:${cell.y}`;
+}
 
 function isWalkable(grid, x, y) {
   return x >= 0 && y >= 0 && x < grid.cols && y < grid.rows && !grid.isBlocked(x, y);
@@ -169,6 +184,9 @@ class RobotEngine {
       // station starts charging immediately instead of going idle and
       // waiting for the next tick's low-battery check to notice again.
       pendingCharge: false,
+      // Set while the robot is only stepping out of another robot's way (see
+      // _stepAside) - its currentTask is then a parking spot, not real work.
+      yielding: false,
       // Consecutive ticks spent stranded with a flat battery - see
       // _recoverStranded.
       strandedTicks: 0,
@@ -292,6 +310,7 @@ class RobotEngine {
     if (!robot) return null;
     robot.taskQueue = [];
     robot.currentTask = null;
+    robot.yielding = false;
     robot.path = null;
     robot.pathIndex = 0;
     robot.waitingTicks = 0;
@@ -332,8 +351,7 @@ class RobotEngine {
     // an integer cell is the only position the rest of the engine (and A*)
     // can plan from once it recovers.
     robot.position = { x: robot.currentCell.x, y: robot.currentCell.y };
-    if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
-    robot.currentTask = null;
+    this._requeueCurrentTask(robot);
     robot.path = null;
     robot.pathIndex = 0;
     return this._snapshot(robot);
@@ -474,8 +492,7 @@ class RobotEngine {
     // Standing on one already - stop here and charge rather than driving
     // off to a further station.
     if (station.x === robot.currentCell.x && station.y === robot.currentCell.y) {
-      if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
-      robot.currentTask = null;
+      this._requeueCurrentTask(robot);
       robot.path = null;
       robot.pathIndex = 0;
       this._setStatus(robot, STATUSES.IDLE);
@@ -486,9 +503,8 @@ class RobotEngine {
 
     // The interrupted destination goes back to the front of the queue, so
     // the trip resumes by itself once the battery is full.
-    if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
+    this._requeueCurrentTask(robot);
     robot.taskQueue.unshift(station);
-    robot.currentTask = null;
     robot.path = null;
     robot.pathIndex = 0;
     robot.pendingCharge = true;
@@ -681,15 +697,22 @@ class RobotEngine {
         // Path exhausted - always resolve this before looking at the
         // remaining budget, otherwise a tick that finishes its path with
         // zero budget left over would never notice the path is done.
+        const steppedAside = robot.yielding;
         robot.path = null;
         robot.pathIndex = 0;
         robot.currentTask = null;
+        robot.yielding = false;
 
         // Arrived at a station it set out for specifically in order to
         // charge (see _maybeDivertToCharge / _maybeAutoCharge). Charging
         // starts here rather than one tick later, and the rest of the
         // queue - including whatever trip was interrupted - waits until
-        // the battery is full, which is what _charge resumes.
+        // the battery is full, which is what _charge resumes. A robot that
+        // only stepped aside on the way keeps that intent for the real trip.
+        if (steppedAside) {
+          if (!this._tryStartNextTask(robot) && robot.status === STATUSES.MOVING) this._setStatus(robot, STATUSES.IDLE);
+          continue;
+        }
         if (robot.pendingCharge && this.grid.isCharging(robot.currentCell.x, robot.currentCell.y)) {
           robot.pendingCharge = false;
           this._setStatus(robot, STATUSES.IDLE);
@@ -715,7 +738,7 @@ class RobotEngine {
       // higher-priority robot processed earlier this same tick) is still
       // respected.
       if (this._occupantOf(target, robot.id)) {
-        if (!this._handleBlocked(robot)) break; // still blocked - hold position
+        if (!this._handleBlocked(robot, target)) break; // still blocked - hold position
         continue; // rerouted onto a new path - re-evaluate from the top
       }
       if (robot.waitingTicks > 0) robot.waitingTicks = 0; // clear to move; no longer waiting
@@ -759,9 +782,32 @@ class RobotEngine {
    * Tracks how long it's been stuck and, past the threshold, attempts to
    * route around the congestion instead of waiting forever. Returns true
    * if it found a new route (caller should re-evaluate this tick), false
-   * if it should just keep waiting. */
-  _handleBlocked(robot) {
+   * if it should just keep waiting.
+   *
+   * If the robot in the way is idle and there is no route around it, it is
+   * asked to step aside. Rerouting alone cannot clear that case when the
+   * occupied cell is the destination itself - a robot that finished a
+   * delivery used to stay parked on the dock, and every later delivery
+   * there queued behind it forever. */
+  _handleBlocked(robot, blockedCell) {
     robot.waitingTicks += 1;
+
+    // A robot that is itself only stepping aside has no real destination,
+    // so rather than waiting on its chosen spot it picks another free one.
+    // Waiting would let a ring of robots each hold the cell the next one
+    // wants, with nobody able to give way.
+    if (robot.yielding) {
+      robot.waitingTicks = 0;
+      return this._stepAside(robot, new Set());
+    }
+
+    // An idle robot standing on this robot's destination is asked to move
+    // straight away - no route around it can ever get there.
+    const occupant = this.robots.get(this._occupantOf(blockedCell, robot.id));
+    const blocksDestination =
+      robot.currentTask && robot.currentTask.x === blockedCell.x && robot.currentTask.y === blockedCell.y;
+    if (occupant && blocksDestination && this._yieldCell(occupant, robot)) return false; // it's moving off - wait for it
+
     if (robot.waitingTicks < DEADLOCK_REROUTE_THRESHOLD) return false;
 
     const rerouted = this._rerouteAroundHazards(robot);
@@ -769,7 +815,121 @@ class RobotEngine {
     // give it a fresh threshold's worth of ticks before trying again,
     // rather than re-running A* every single tick while stuck.
     robot.waitingTicks = 0;
-    return rerouted;
+    if (rerouted) return true;
+
+    // No way round - an idle robot in the way steps aside after all.
+    if (occupant && this._yieldCell(occupant, robot)) return false;
+
+    // Rerouting cannot help when the robot in the way is standing on this
+    // robot's destination and wants to go where this one stands - a
+    // head-on swap, or a longer ring of robots each waiting on the next.
+    // One of them has to back off: it steps aside and then resumes its
+    // trip. The robot with the greater id does, so the two do not normally
+    // both back off at once and any ring has at least one robot that gives
+    // way - unless that robot is boxed in with nowhere to go (typically a
+    // robot on a dock that the others are all queued around), in which
+    // case the other one makes room instead. An idle occupant has already
+    // been asked to step aside above, so reaching here means it cannot.
+    if (occupant?.status !== STATUSES.MOVING && occupant?.status !== STATUSES.IDLE) return false;
+    const occupantCanBackOff =
+      occupant.status === STATUSES.MOVING &&
+      robot.id < occupant.id &&
+      this._findYieldSpot(occupant, this._remainingRoute(robot)) !== null;
+    if (occupantCanBackOff) return false;
+    return this._stepAside(robot, this._remainingRoute(occupant));
+  }
+
+  /** Moves an idle robot with nothing queued off the cell `forRobot`
+   * needs. Only robots with nothing to do are moved: a charging, broken or
+   * busy robot keeps its place, and the blocked robot falls back to
+   * waiting and rerouting as before. Returns true if the robot is now
+   * moving out of the way. */
+  _yieldCell(robot, forRobot) {
+    if (robot.status !== STATUSES.IDLE || robot.taskQueue.length > 0 || robot.battery <= 0) return false;
+    return this._stepAside(robot, this._remainingRoute(forRobot));
+  }
+
+  /** The cells still ahead on a robot's current path, as cellKey()s. */
+  _remainingRoute(robot) {
+    const cells = new Set();
+    for (let i = robot.pathIndex; i < (robot.path?.length ?? 0); i++) cells.add(cellKey(robot.path[i]));
+    return cells;
+  }
+
+  /** Sends `robot` to the best free cell within YIELD_SEARCH_RADIUS that is
+   * not in `keepClear`, and marks it as `yielding`. "Best" is the closest,
+   * with a penalty for cells on another moving robot's route and for docks
+   * and charging stations - so the robot neither steps into someone else's
+   * way nor goes and blocks the next station. A robot that was on its way
+   * somewhere keeps that trip at the front of its queue and resumes it once
+   * it has stepped aside. Returns true if it moved. */
+  _stepAside(robot, keepClear) {
+    const spot = this._findYieldSpot(robot, keepClear);
+    if (!spot) return false;
+
+    this._requeueCurrentTask(robot);
+    robot.path = spot.path;
+    robot.pathIndex = 0;
+    robot.currentTask = spot.cell;
+    robot.yielding = true;
+    this._setStatus(robot, STATUSES.MOVING);
+    return true;
+  }
+
+  /** Breadth-first search out from `robot`'s cell, through free walkable
+   * cells, scoring every reachable cell outside `keepClear` (see
+   * _stepAside). Returns `{ cell, path }` (path excludes the start cell),
+   * or null if nothing within YIELD_SEARCH_RADIUS qualifies. */
+  _findYieldSpot(robot, keepClear) {
+    const grid = this._effectiveGrid();
+    const occupied = new Set();
+    const onOtherRoutes = new Set();
+    for (const other of this.robots.values()) {
+      if (other.id === robot.id) continue;
+      occupied.add(cellKey(other.currentCell));
+      if (other.status !== STATUSES.MOVING || !other.path) continue;
+      for (let i = other.pathIndex; i < other.path.length; i++) onOtherRoutes.add(cellKey(other.path[i]));
+    }
+    const isStation = (c) => this.grid.isCharging(c.x, c.y) || Boolean(this.grid.isDock?.(c.x, c.y));
+
+    const start = robot.currentCell;
+    const parents = new Map([[cellKey(start), null]]);
+    let frontier = [start];
+    let best = null;
+
+    for (let depth = 1; depth <= YIELD_SEARCH_RADIUS && frontier.length > 0; depth++) {
+      const next = [];
+      for (const cell of frontier) {
+        for (const { dx, dy } of ORTHOGONAL_STEPS) {
+          const candidate = { x: cell.x + dx, y: cell.y + dy };
+          const key = cellKey(candidate);
+          if (parents.has(key) || occupied.has(key) || !isWalkable(grid, candidate.x, candidate.y)) continue;
+          parents.set(key, cell);
+          next.push(candidate);
+          if (keepClear.has(key)) continue;
+          const score = depth + (onOtherRoutes.has(key) ? 4 : 0) + (isStation(candidate) ? 6 : 0);
+          if (!best || score < best.score) best = { cell: candidate, score };
+        }
+      }
+      frontier = next;
+    }
+
+    return best ? { cell: best.cell, path: this._pathFromParents(parents, best.cell) } : null;
+  }
+
+  /** Puts an interrupted destination back at the front of the queue so the
+   * trip resumes later - unless the robot was only stepping aside, in which
+   * case there is nothing to resume. */
+  _requeueCurrentTask(robot) {
+    if (robot.currentTask && !robot.yielding) robot.taskQueue.unshift(robot.currentTask);
+    robot.currentTask = null;
+    robot.yielding = false;
+  }
+
+  _pathFromParents(parents, end) {
+    const path = [];
+    for (let cell = end; parents.get(cellKey(cell)); cell = parents.get(cellKey(cell))) path.unshift(cell);
+    return path;
   }
 
   /** True if any cell still ahead on this robot's current path is now
@@ -874,8 +1034,7 @@ class RobotEngine {
       robot.position = { x: robot.currentCell.x, y: robot.currentCell.y };
       // Put the interrupted destination back at the front of the queue so
       // it resumes automatically once the robot is recharged and cleared.
-      if (robot.currentTask) robot.taskQueue.unshift(robot.currentTask);
-      robot.currentTask = null;
+      this._requeueCurrentTask(robot);
       robot.path = null;
       robot.pathIndex = 0;
       return false;
